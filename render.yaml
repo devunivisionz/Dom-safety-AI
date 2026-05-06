@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ai-safety-manager-form-service
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FORM_SUBMIT_MODE
+        value: test
+      - key: AIRTABLE_FORM_URL
+        value: https://airtable.com/appUOdowBcsT6bVlS/pagzDVVSW2w9Nx1Mz/form
+      - key: FORM_SERVICE_TOKEN
+        sync: false
