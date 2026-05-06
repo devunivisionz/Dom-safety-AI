@@ -3,7 +3,7 @@ services:
     name: ai-safety-manager-form-service
     env: node
     plan: starter
-    buildCommand: npm install
+    buildCommand: ./build.sh
     startCommand: npm start
     envVars:
       - key: NODE_ENV
