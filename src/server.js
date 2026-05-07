@@ -180,12 +180,21 @@ async function chooseCombo(page, label, value) {
 
 async function chooseLinkedProject(page, value) {
   if (!value) return '';
-  await page.getByRole('button', { name: 'Add project to Project Site field', exact: true }).click();
-  const search = page.getByRole('combobox', { name: 'Search', exact: true });
+  await page.getByRole('button', { name: /add\s+project/i }).first().click();
+  const search = page
+    .getByRole('combobox', { name: 'Search', exact: true })
+    .or(page.getByRole('combobox', { name: /search/i }))
+    .first();
   await search.fill(String(value));
   const option = page.getByRole('option', { name: String(value), exact: true });
   await option.click();
   return value;
+}
+
+async function dismissCookieBanner(page) {
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.getByRole('button', { name: /close/i }).first().click({ timeout: 2000 }).catch(() => undefined);
+  await page.locator('button[aria-label="Close"]').first().click({ timeout: 2000 }).catch(() => undefined);
 }
 
 async function chooseRadio(page, groupLabel, optionLabel) {
@@ -280,6 +289,7 @@ async function fillForm(payload, req) {
       await page.goto(FORM_URL, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
       await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
       await page.getByText(/Date\s+of\s+event/i).first().waitFor({ timeout: FORM_READY_TIMEOUT_MS });
+      await dismissCookieBanner(page);
     });
 
     await stage('fill date', () => fillText(page, 'Date of Event', dateForAirtable(payload.date_of_event)));
@@ -388,7 +398,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'robust-airtable-labels' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'robust-project-picker' });
 });
 
 async function submitObservationForm(req, res) {
