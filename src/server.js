@@ -38,6 +38,14 @@ const FOLLOW_UP_LABELS = {
   NA: 'NA',
 };
 
+const SEVERITY_LABELS = {
+  Low: 'Low',
+  Medium: 'Medium',
+  High: 'High',
+};
+
+const REGEX_SPECIALS = /[\\^$.*+?()[\]{}|]/g;
+
 function normalizeObservation(value) {
   const text = String(value || '').trim().toLowerCase();
   if (text.includes('unsafe condition')) return 'Unsafe Condition';
@@ -57,6 +65,13 @@ function normalizeFollowUp(value) {
   return 'Follow Up Needed';
 }
 
+function normalizeSeverity(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (text === 'low') return 'Low';
+  if (text === 'high') return 'High';
+  return 'Medium';
+}
+
 function isUnsetOption(value) {
   const text = clean(value).toLowerCase();
   return !text || text === 'none' || text === 'n/a' || text === 'na' || text === 'unknown';
@@ -65,6 +80,7 @@ function isUnsetOption(value) {
 function normalizePayload(body) {
   const dateTime = splitDateTime(body.date_of_event, body.time);
   const observation = normalizeObservation(body.type_of_observation);
+  const severity = normalizeSeverity(body.severity);
   const stopWork = normalizeStopWork(body.stop_work_authority_used);
   const followUp = normalizeFollowUp(body.followup_status);
 
@@ -79,9 +95,11 @@ function normalizePayload(body) {
     contractor_observed: clean(body.contractor_observed) || 'None',
     type_of_observation: observation,
     type_of_hazard: clean(body.type_of_hazard),
+    severity,
     positive_safe_observation: clean(body.positive_safe_observation),
     stop_work_authority_used: stopWork,
     description_of_event: clean(body.description_of_event),
+    corrective_action: clean(body.corrective_action),
     followup_status: followUp,
     photo_base64: clean(body.photo_base64),
     photo_url: clean(body.photo_url),
@@ -89,6 +107,7 @@ function normalizePayload(body) {
     photo_content_type: clean(body.photo_content_type) || 'image/jpeg',
     selected_values: {
       type_of_observation: TYPE_OF_OBSERVATION_LABELS[observation],
+      severity: SEVERITY_LABELS[severity],
       stop_work_authority_used: STOP_WORK_LABELS[stopWork],
       followup_status: FOLLOW_UP_LABELS[followUp],
     },
@@ -114,23 +133,33 @@ function normalizeTime(value) {
   if (!match) return '';
   const hours = Math.max(0, Math.min(23, Number(match[1])));
   const minutes = Math.max(0, Math.min(59, Number(match[2])));
-  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+  return String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0');
 }
 
 function dateForAirtable(date) {
   const [year, month, day] = date.split('-');
-  return `${day}/${month}/${year}`;
+  return day + '/' + month + '/' + year;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(REGEX_SPECIALS, '\\$&');
+}
+
+function byLabel(page, label) {
+  return page
+    .getByLabel(label, { exact: true })
+    .or(page.getByLabel(new RegExp('^' + escapeRegExp(label) + '\\s*\\*?$', 'i')))
+    .first();
 }
 
 async function fillText(page, label, value) {
   if (!value) return;
-  const field = page.getByLabel(label, { exact: true });
-  await field.fill(String(value));
+  await byLabel(page, label).fill(String(value));
 }
 
 async function chooseCombo(page, label, value) {
   if (!value) return '';
-  const combo = page.getByLabel(label, { exact: true });
+  const combo = byLabel(page, label);
   await combo.click();
   const search = page.getByRole('combobox', { name: 'Find an option' });
   await search.fill(String(value));
@@ -150,16 +179,48 @@ async function chooseLinkedProject(page, value) {
 }
 
 async function chooseRadio(page, groupLabel, optionLabel) {
-  const group = page.getByRole('radiogroup', { name: groupLabel, exact: true });
+  const group = page
+    .getByRole('radiogroup', { name: groupLabel, exact: true })
+    .or(page.getByRole('radiogroup', { name: new RegExp('^' + escapeRegExp(groupLabel) + '\\s*\\*?$', 'i') }))
+    .first();
   await group.getByRole('radio', { name: optionLabel, exact: true }).check();
   return optionLabel;
 }
 
+async function chooseComboOrRadio(page, label, value) {
+  if (!value) return '';
+  try {
+    return await chooseCombo(page, label, value);
+  } catch (comboError) {
+    try {
+      return await chooseRadio(page, label, value);
+    } catch (radioError) {
+      throw new Error(
+        'Unable to choose "' + label + '" value "' + value + '". Combo failed: ' +
+          comboError.message + '. Radio failed: ' + radioError.message
+      );
+    }
+  }
+}
+
+async function checkCheckboxIfPresent(page, label) {
+  try {
+    const checkbox = byLabel(page, label);
+    if (await checkbox.count()) {
+      await checkbox.check();
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 function artifactUrl(req, path) {
   if (!path) return '';
-  const origin = `${req.protocol}://${req.get('host')}`;
+  const origin = req.protocol + '://' + req.get('host');
   const relative = path.startsWith(tmpdir()) ? path.slice(tmpdir().length).replace(/^\/+/, '') : path;
-  return `${origin}/artifacts/${relative.split('/').map(encodeURIComponent).join('/')}`;
+  return origin + '/artifacts/' + relative.split('/').map(encodeURIComponent).join('/');
 }
 
 async function fillForm(payload, req) {
@@ -192,8 +253,11 @@ async function fillForm(payload, req) {
       : await chooseCombo(page, 'Name of Contractor Observed', payload.contractor_observed);
     selected.type_of_observation = await chooseRadio(page, 'Type of Observation', TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]);
     selected.type_of_hazard = await chooseCombo(page, 'Type of Hazard', payload.type_of_hazard);
+    selected.severity = await chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity]);
+    selected.confirmation_checked = await checkCheckboxIfPresent(page, 'Please check this box');
     selected.stop_work_authority_used = await chooseRadio(page, 'Stop Work Authority Used?', STOP_WORK_LABELS[payload.stop_work_authority_used]);
     await fillText(page, 'Description of Event (original)', payload.description_of_event || payload.positive_safe_observation);
+    await fillText(page, 'Corrective Action', payload.corrective_action);
     selected.followup_status = await chooseRadio(page, 'Was the issue corrected onsite or is follow up needed?', FOLLOW_UP_LABELS[payload.followup_status]);
 
     if (payload.photo_base64 || payload.photo_url) {
@@ -203,7 +267,7 @@ async function fillForm(payload, req) {
       } else {
         const response = await fetch(payload.photo_url);
         if (!response.ok) {
-          throw new Error(`Unable to download photo_url: ${response.status} ${response.statusText}`);
+          throw new Error('Unable to download photo_url: ' + response.status + ' ' + response.statusText);
         }
         await writeFile(photoPath, Buffer.from(await response.arrayBuffer()));
       }
@@ -269,12 +333,21 @@ async function fillForm(payload, req) {
   }
 }
 
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'AI Safety Manager Form Service',
+    submit_mode: SUBMIT_MODE,
+    endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
+  });
+});
+
 app.get('/health', (req, res) => {
   res.json({ ok: true, submit_mode: SUBMIT_MODE });
 });
 
-app.post('/submit-observation-form', async (req, res) => {
-  if (TOKEN && req.get('authorization') !== `Bearer ${TOKEN}`) {
+async function submitObservationForm(req, res) {
+  if (TOKEN && req.get('authorization') !== 'Bearer ' + TOKEN) {
     res.status(401).json({ success: false, error: 'Unauthorized' });
     return;
   }
@@ -282,8 +355,11 @@ app.post('/submit-observation-form', async (req, res) => {
   const payload = normalizePayload(req.body || {});
   const result = await fillForm(payload, req);
   res.status(result.success ? 200 : 422).json(result);
-});
+}
+
+app.post('/', submitObservationForm);
+app.post('/submit-observation-form', submitObservationForm);
 
 app.listen(PORT, () => {
-  console.log(`AI Safety Manager form service listening on ${PORT}`);
+  console.log('AI Safety Manager form service listening on ' + PORT);
 });
