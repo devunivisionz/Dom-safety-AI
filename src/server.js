@@ -244,7 +244,6 @@ async function fillForm(payload, req) {
       ],
     });
     context = await browser.newContext({
-      recordVideo: { dir: tmpDir, size: { width: 1280, height: 720 } },
       viewport: { width: 1280, height: 720 },
     });
     page = await context.newPage();
@@ -302,9 +301,7 @@ async function fillForm(payload, req) {
     const afterPath = join(tmpDir, submitted ? 'after-submit.png' : 'test-filled.png');
     await page.screenshot({ path: afterPath, fullPage: true });
 
-    const videoHandle = page.video();
     await context.close();
-    const video = videoHandle ? await videoHandle.path().catch(() => '') : '';
     await browser.close();
 
     return {
@@ -316,10 +313,8 @@ async function fillForm(payload, req) {
         directory: tmpDir,
         before_submit_screenshot: beforeSubmitPath,
         final_screenshot: afterPath,
-        video,
         before_submit_screenshot_url: artifactUrl(req, beforeSubmitPath),
         final_screenshot_url: artifactUrl(req, afterPath),
-        video_url: artifactUrl(req, video),
       },
     };
   } catch (error) {
