@@ -225,20 +225,24 @@ function artifactUrl(req, path) {
 
 async function fillForm(payload, req) {
   const tmpDir = await mkdtemp(join(tmpdir(), 'safety-observation-'));
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
-  const context = await browser.newContext({
-    recordVideo: { dir: tmpDir, size: { width: 1280, height: 720 } },
-    viewport: { width: 1280, height: 720 },
-  });
-  const page = await context.newPage();
   const selected = { ...payload.selected_values };
+  let browser;
+  let context;
+  let page;
   let photoPath = '';
   let submitted = false;
 
   try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    context = await browser.newContext({
+      recordVideo: { dir: tmpDir, size: { width: 1280, height: 720 } },
+      viewport: { width: 1280, height: 720 },
+    });
+    page = await context.newPage();
+
     await page.goto(FORM_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.getByRole('heading', { name: 'Good Catch/Positive Observations', exact: true }).waitFor({ timeout: 30000 });
 
@@ -314,9 +318,15 @@ async function fillForm(payload, req) {
     };
   } catch (error) {
     const errorPath = join(tmpDir, 'error.png');
-    await page.screenshot({ path: errorPath, fullPage: true }).catch(() => undefined);
-    await context.close().catch(() => undefined);
-    await browser.close().catch(() => undefined);
+    if (page) {
+      await page.screenshot({ path: errorPath, fullPage: true }).catch(() => undefined);
+    }
+    if (context) {
+      await context.close().catch(() => undefined);
+    }
+    if (browser) {
+      await browser.close().catch(() => undefined);
+    }
 
     return {
       success: false,
@@ -326,8 +336,8 @@ async function fillForm(payload, req) {
       error: error.message,
       artifacts: {
         directory: tmpDir,
-        error_screenshot: errorPath,
-        error_screenshot_url: artifactUrl(req, errorPath),
+        error_screenshot: page ? errorPath : '',
+        error_screenshot_url: page ? artifactUrl(req, errorPath) : '',
       },
     };
   }
