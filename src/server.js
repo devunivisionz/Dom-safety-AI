@@ -353,7 +353,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'structured-form-response' });
 });
 
 async function submitObservationForm(req, res) {
@@ -364,7 +364,7 @@ async function submitObservationForm(req, res) {
 
   const payload = normalizePayload(req.body || {});
   const result = await fillForm(payload, req);
-  res.status(result.success ? 200 : 422).json(result);
+  res.status(200).json(result);
 }
 
 app.post('/', submitObservationForm);
