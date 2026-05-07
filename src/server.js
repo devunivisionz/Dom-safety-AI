@@ -1,5 +1,6 @@
 import express from 'express';
-import { chromium } from '@playwright/test';
+import serverlessChromium from '@sparticuz/chromium';
+import { chromium as playwrightChromium } from 'playwright-core';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -233,9 +234,14 @@ async function fillForm(payload, req) {
   let submitted = false;
 
   try {
-    browser = await chromium.launch({
+    browser = await playwrightChromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      executablePath: process.env.CHROMIUM_EXECUTABLE_PATH || await serverlessChromium.executablePath(),
+      args: [
+        ...serverlessChromium.args,
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+      ],
     });
     context = await browser.newContext({
       recordVideo: { dir: tmpDir, size: { width: 1280, height: 720 } },
