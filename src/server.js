@@ -16,6 +16,7 @@ const TOKEN = process.env.FORM_SERVICE_TOKEN || '';
 const SUBMIT_MODE = process.env.FORM_SUBMIT_MODE || 'test';
 const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 10000);
 const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 45000);
+const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 30000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 
 const DEFAULTS = {
@@ -149,10 +150,15 @@ function escapeRegExp(value) {
   return String(value).replace(REGEX_SPECIALS, '\\$&');
 }
 
+function labelRegex(label) {
+  const escaped = escapeRegExp(label).replace(/\\ /g, '\\s+');
+  return new RegExp('^\\s*' + escaped + '\\s*\\*?\\s*:?\\s*$', 'i');
+}
+
 function byLabel(page, label) {
   return page
     .getByLabel(label, { exact: true })
-    .or(page.getByLabel(new RegExp('^' + escapeRegExp(label) + '\\s*\\*?$', 'i')))
+    .or(page.getByLabel(labelRegex(label)))
     .first();
 }
 
@@ -185,7 +191,7 @@ async function chooseLinkedProject(page, value) {
 async function chooseRadio(page, groupLabel, optionLabel) {
   const group = page
     .getByRole('radiogroup', { name: groupLabel, exact: true })
-    .or(page.getByRole('radiogroup', { name: new RegExp('^' + escapeRegExp(groupLabel) + '\\s*\\*?$', 'i') }))
+    .or(page.getByRole('radiogroup', { name: labelRegex(groupLabel) }))
     .first();
   await group.getByRole('radio', { name: optionLabel, exact: true }).check();
   return optionLabel;
@@ -272,7 +278,8 @@ async function fillForm(payload, req) {
 
     await stage('open Airtable form', async () => {
       await page.goto(FORM_URL, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
-      await byLabel(page, 'Date of Event').waitFor({ timeout: ACTION_TIMEOUT_MS });
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
+      await page.getByText(/Date\s+of\s+event/i).first().waitFor({ timeout: FORM_READY_TIMEOUT_MS });
     });
 
     await stage('fill date', () => fillText(page, 'Date of Event', dateForAirtable(payload.date_of_event)));
@@ -381,7 +388,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'structured-form-response' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'robust-airtable-labels' });
 });
 
 async function submitObservationForm(req, res) {
