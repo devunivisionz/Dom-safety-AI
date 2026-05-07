@@ -14,6 +14,9 @@ const PORT = Number(process.env.PORT || 3000);
 const FORM_URL = process.env.AIRTABLE_FORM_URL || 'https://airtable.com/appUOdowBcsT6bVlS/pagzDVVSW2w9Nx1Mz/form';
 const TOKEN = process.env.FORM_SERVICE_TOKEN || '';
 const SUBMIT_MODE = process.env.FORM_SUBMIT_MODE || 'test';
+const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 10000);
+const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 45000);
+const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 
 const DEFAULTS = {
   project_site: 'Bauxite III (BWI100)',
@@ -224,6 +227,16 @@ function artifactUrl(req, path) {
   return origin + '/artifacts/' + relative.split('/').map(encodeURIComponent).join('/');
 }
 
+async function safeScreenshot(page, path) {
+  if (!page) return '';
+  try {
+    await page.screenshot({ path, fullPage: false, timeout: SCREENSHOT_TIMEOUT_MS });
+    return path;
+  } catch {
+    return '';
+  }
+}
+
 async function fillForm(payload, req) {
   const tmpDir = await mkdtemp(join(tmpdir(), 'safety-observation-'));
   const selected = { ...payload.selected_values };
@@ -232,9 +245,16 @@ async function fillForm(payload, req) {
   let page;
   let photoPath = '';
   let submitted = false;
+  let stageName = 'initializing';
+
+  const stage = async (name, fn) => {
+    stageName = name;
+    console.log('form-service stage: ' + name);
+    return fn();
+  };
 
   try {
-    browser = await playwrightChromium.launch({
+    browser = await stage('launch browser', async () => playwrightChromium.launch({
       headless: true,
       executablePath: process.env.CHROMIUM_EXECUTABLE_PATH || await serverlessChromium.executablePath(),
       args: [
@@ -242,64 +262,72 @@ async function fillForm(payload, req) {
         '--no-sandbox',
         '--disable-setuid-sandbox',
       ],
-    });
-    context = await browser.newContext({
+    }));
+    context = await stage('create browser context', () => browser.newContext({
       viewport: { width: 1280, height: 720 },
+    }));
+    page = await stage('create page', () => context.newPage());
+    page.setDefaultTimeout(ACTION_TIMEOUT_MS);
+    page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
+
+    await stage('open Airtable form', async () => {
+      await page.goto(FORM_URL, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
+      await byLabel(page, 'Date of Event').waitFor({ timeout: ACTION_TIMEOUT_MS });
     });
-    page = await context.newPage();
 
-    await page.goto(FORM_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.getByRole('heading', { name: 'Good Catch/Positive Observations', exact: true }).waitFor({ timeout: 30000 });
-
-    await fillText(page, 'Date of Event', dateForAirtable(payload.date_of_event));
-    await fillText(page, 'Time', payload.time);
-    selected.project_site = await chooseLinkedProject(page, payload.project_site);
-    await fillText(page, 'Your Name (First and Last)', payload.reporter_name);
-    await fillText(page, 'Your Email Address', payload.reporter_email);
-    selected.company_name = await chooseCombo(page, 'Name of Company', payload.company_name);
+    await stage('fill date', () => fillText(page, 'Date of Event', dateForAirtable(payload.date_of_event)));
+    await stage('fill time', () => fillText(page, 'Time', payload.time));
+    selected.project_site = await stage('choose project site', () => chooseLinkedProject(page, payload.project_site));
+    await stage('fill reporter name', () => fillText(page, 'Your Name (First and Last)', payload.reporter_name));
+    await stage('fill reporter email', () => fillText(page, 'Your Email Address', payload.reporter_email));
+    selected.company_name = await stage('choose company', () => chooseCombo(page, 'Name of Company', payload.company_name));
     selected.contractor_observed = isUnsetOption(payload.contractor_observed)
       ? ''
-      : await chooseCombo(page, 'Name of Contractor Observed', payload.contractor_observed);
-    selected.type_of_observation = await chooseRadio(page, 'Type of Observation', TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]);
-    selected.type_of_hazard = await chooseCombo(page, 'Type of Hazard', payload.type_of_hazard);
-    selected.severity = await chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity]);
-    selected.confirmation_checked = await checkCheckboxIfPresent(page, 'Please check this box');
-    selected.stop_work_authority_used = await chooseRadio(page, 'Stop Work Authority Used?', STOP_WORK_LABELS[payload.stop_work_authority_used]);
-    await fillText(page, 'Description of Event (original)', payload.description_of_event || payload.positive_safe_observation);
-    await fillText(page, 'Corrective Action', payload.corrective_action);
-    selected.followup_status = await chooseRadio(page, 'Was the issue corrected onsite or is follow up needed?', FOLLOW_UP_LABELS[payload.followup_status]);
+      : await stage('choose contractor observed', () => chooseCombo(page, 'Name of Contractor Observed', payload.contractor_observed));
+    selected.type_of_observation = await stage('choose type of observation', () => chooseRadio(page, 'Type of Observation', TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]));
+    selected.type_of_hazard = await stage('choose type of hazard', () => chooseCombo(page, 'Type of Hazard', payload.type_of_hazard));
+    selected.severity = await stage('choose severity', () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity]));
+    selected.confirmation_checked = await stage('check confirmation', () => checkCheckboxIfPresent(page, 'Please check this box'));
+    selected.stop_work_authority_used = await stage('choose stop work authority', () => chooseRadio(page, 'Stop Work Authority Used?', STOP_WORK_LABELS[payload.stop_work_authority_used]));
+    await stage('fill description', () => fillText(page, 'Description of Event (original)', payload.description_of_event || payload.positive_safe_observation));
+    await stage('fill corrective action', () => fillText(page, 'Corrective Action', payload.corrective_action));
+    selected.followup_status = await stage('choose follow-up status', () => chooseRadio(page, 'Was the issue corrected onsite or is follow up needed?', FOLLOW_UP_LABELS[payload.followup_status]));
 
     if (payload.photo_base64 || payload.photo_url) {
-      photoPath = join(tmpDir, payload.photo_filename);
-      if (payload.photo_base64) {
-        await writeFile(photoPath, Buffer.from(payload.photo_base64, 'base64'));
-      } else {
-        const response = await fetch(payload.photo_url);
-        if (!response.ok) {
-          throw new Error('Unable to download photo_url: ' + response.status + ' ' + response.statusText);
+      await stage('attach photo', async () => {
+        photoPath = join(tmpDir, payload.photo_filename);
+        if (payload.photo_base64) {
+          await writeFile(photoPath, Buffer.from(payload.photo_base64, 'base64'));
+        } else {
+          const response = await fetch(payload.photo_url);
+          if (!response.ok) {
+            throw new Error('Unable to download photo_url: ' + response.status + ' ' + response.statusText);
+          }
+          await writeFile(photoPath, Buffer.from(await response.arrayBuffer()));
         }
-        await writeFile(photoPath, Buffer.from(await response.arrayBuffer()));
-      }
-      const fileInput = page.locator('input[type="file"]');
-      await fileInput.setInputFiles(photoPath);
+        const fileInput = page.locator('input[type="file"]');
+        await fileInput.setInputFiles(photoPath);
+      });
     }
 
     const beforeSubmitPath = join(tmpDir, 'before-submit.png');
-    await page.screenshot({ path: beforeSubmitPath, fullPage: true });
+    const beforeSubmitScreenshot = await stage('capture before-submit screenshot', () => safeScreenshot(page, beforeSubmitPath));
 
     const shouldSubmit = !payload.test_mode && SUBMIT_MODE === 'live';
     if (shouldSubmit) {
-      const submitButton = page
-        .getByRole('button', { name: 'Submit Observation', exact: true })
-        .or(page.getByRole('button', { name: 'Submit', exact: true }))
-        .first();
-      await submitButton.click();
-      submitted = true;
-      await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => undefined);
+      await stage('submit form', async () => {
+        const submitButton = page
+          .getByRole('button', { name: 'Submit Observation', exact: true })
+          .or(page.getByRole('button', { name: 'Submit', exact: true }))
+          .first();
+        await submitButton.click();
+        submitted = true;
+        await page.waitForLoadState('networkidle', { timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
+      });
     }
 
     const afterPath = join(tmpDir, submitted ? 'after-submit.png' : 'test-filled.png');
-    await page.screenshot({ path: afterPath, fullPage: true });
+    const finalScreenshot = await stage('capture final screenshot', () => safeScreenshot(page, afterPath));
 
     await context.close();
     await browser.close();
@@ -311,17 +339,15 @@ async function fillForm(payload, req) {
       selected_values: selected,
       artifacts: {
         directory: tmpDir,
-        before_submit_screenshot: beforeSubmitPath,
-        final_screenshot: afterPath,
-        before_submit_screenshot_url: artifactUrl(req, beforeSubmitPath),
-        final_screenshot_url: artifactUrl(req, afterPath),
+        before_submit_screenshot: beforeSubmitScreenshot,
+        final_screenshot: finalScreenshot,
+        before_submit_screenshot_url: artifactUrl(req, beforeSubmitScreenshot),
+        final_screenshot_url: artifactUrl(req, finalScreenshot),
       },
     };
   } catch (error) {
     const errorPath = join(tmpDir, 'error.png');
-    if (page) {
-      await page.screenshot({ path: errorPath, fullPage: true }).catch(() => undefined);
-    }
+    const errorScreenshot = await safeScreenshot(page, errorPath);
     if (context) {
       await context.close().catch(() => undefined);
     }
@@ -334,11 +360,12 @@ async function fillForm(payload, req) {
       submitted,
       test_mode: payload.test_mode,
       selected_values: selected,
-      error: error.message,
+      failed_stage: stageName,
+      error: '[' + stageName + '] ' + error.message,
       artifacts: {
         directory: tmpDir,
-        error_screenshot: page ? errorPath : '',
-        error_screenshot_url: page ? artifactUrl(req, errorPath) : '',
+        error_screenshot: errorScreenshot,
+        error_screenshot_url: artifactUrl(req, errorScreenshot),
       },
     };
   }
