@@ -168,15 +168,35 @@ async function fillText(page, label, value) {
   await byLabel(page, label).fill(String(value));
 }
 
+async function clickVisibleOption(page, value, timeout = 3000) {
+  const option = page
+    .getByRole('option', { name: String(value), exact: true })
+    .or(page.getByRole('option', { name: new RegExp(escapeRegExp(value), 'i') }))
+    .or(page.getByText(String(value), { exact: true }))
+    .or(page.getByText(new RegExp(escapeRegExp(value), 'i')))
+    .first();
+  if (!(await option.isVisible({ timeout }).catch(() => false))) return false;
+  await option.click();
+  return true;
+}
+
 async function chooseCombo(page, label, value) {
   if (!value) return '';
   const combo = byLabel(page, label);
   await combo.click();
-  const search = page.getByRole('combobox', { name: 'Find an option' });
+  if (await clickVisibleOption(page, value)) return value;
+  const search = page
+    .getByRole('combobox', { name: 'Find an option' })
+    .or(page.getByRole('combobox', { name: /find/i }))
+    .or(page.getByRole('combobox', { name: /search/i }))
+    .or(page.locator('input[placeholder*="Find" i]'))
+    .or(page.locator('input[placeholder*="Search" i]'))
+    .or(page.locator('input[type="text"]'))
+    .first();
+  await search.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
   await search.fill(String(value));
-  const option = page.getByRole('option', { name: String(value), exact: true });
-  await option.click();
-  return value;
+  if (await clickVisibleOption(page, value, ACTION_TIMEOUT_MS)) return value;
+  throw new Error('No visible option found for "' + label + '" value "' + value + '"');
 }
 
 async function chooseLinkedProject(page, value) {
@@ -184,11 +204,7 @@ async function chooseLinkedProject(page, value) {
   const addButton = page.getByRole('button', { name: /add\s+project/i }).first();
   await addButton.scrollIntoViewIfNeeded();
   await addButton.click();
-  const visibleOption = page.getByText(String(value), { exact: true }).first();
-  if (await visibleOption.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await visibleOption.click();
-    return value;
-  }
+  if (await clickVisibleOption(page, value)) return value;
   const search = page
     .getByRole('combobox', { name: 'Search', exact: true })
     .or(page.getByRole('combobox', { name: /search/i }))
@@ -199,13 +215,8 @@ async function chooseLinkedProject(page, value) {
     .first();
   await search.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
   await search.fill(String(value));
-  const option = page
-    .getByRole('option', { name: String(value), exact: true })
-    .or(page.getByRole('option', { name: new RegExp(escapeRegExp(value), 'i') }))
-    .or(page.getByText(new RegExp(escapeRegExp(value), 'i')))
-    .first();
-  await option.click({ timeout: ACTION_TIMEOUT_MS });
-  return value;
+  if (await clickVisibleOption(page, value, ACTION_TIMEOUT_MS)) return value;
+  throw new Error('No visible project option found for "' + value + '"');
 }
 
 async function dismissCookieBanner(page) {
@@ -450,7 +461,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'direct-project-option-click' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'visible-combo-option-click' });
 });
 
 async function submitObservationForm(req, res) {
