@@ -226,19 +226,49 @@ async function chooseCombo(page, label, value) {
   const combo = comboByLabel(page, label);
   await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
   await combo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+
+  // Airtable opens single-selects in two different ways depending on context:
+  //   * As role="dialog" (linked-record-style picker, modal)
+  //   * As role="listbox" (inline single-select dropdown, e.g. "Name of Company")
+  // Wait for whichever appears first.
+  const popover = page
+    .getByRole('dialog')
+    .or(page.getByRole('listbox'))
+    .first();
+  await popover.waitFor({ state: 'visible', timeout: 5000 }).catch(() => undefined);
+
+  // Try clicking the option immediately -- many inline listboxes show options
+  // without needing to type.
   if (await clickVisibleOption(page, value)) return value;
-  const search = page
-    .locator('[role="dialog"] input[role="combobox"]')
-    .or(page.locator('[role="dialog"] input[placeholder*="Search" i]'))
-    .or(page.locator('[role="dialog"] input[placeholder*="Find" i]'))
-    .or(page.locator('[data-testid*="linkedRecord"] input[type="text"]'))
+
+  // If a search input is available (it usually is for searchable selects),
+  // look for it in the popover first, then fall back to a recently-appeared
+  // input near the page. Never fall back to the global page input set.
+  const searchInPopover = popover
+    .locator('input[role="combobox"]')
+    .or(popover.locator('input[placeholder*="Search" i]'))
+    .or(popover.locator('input[placeholder*="Find" i]'))
+    .or(popover.locator('input[type="text"]'))
     .first();
 
-  await search.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
-  await search.fill(String(value));
-  if (await clickVisibleOption(page, value, ACTION_TIMEOUT_MS)) return value;
+  const searchAvailable = await searchInPopover.isVisible({ timeout: 2000 }).catch(() => false);
+
+  if (searchAvailable) {
+    await searchInPopover.click({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
+    try {
+      await searchInPopover.fill('', { timeout: 2000 });
+    } catch {
+      // ignore -- some inputs reject empty fill
+    }
+    await searchInPopover.type(String(value), { delay: 30 });
+    await page.waitForTimeout(400);
+
+    if (await clickVisibleOption(page, value, ACTION_TIMEOUT_MS)) return value;
+  }
+
+  // Diagnostic: list visible options so the next failure tells us the real names.
   const visibleOptions = await visibleOptionNames(page);
-  const suffix = visibleOptions.length ? '. Visible options: ' + visibleOptions.join(', ') : '';
+  const suffix = visibleOptions.length ? '. Visible options: ' + visibleOptions.join(' | ') : '';
   throw new Error('No visible option found for "' + label + '" value "' + value + '"' + suffix);
 }
 
@@ -610,7 +640,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'company-as-single-select' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'combo-listbox-or-dialog' });
 });
 
 async function submitObservationForm(req, res) {
