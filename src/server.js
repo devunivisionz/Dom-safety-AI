@@ -512,143 +512,32 @@ async function checkCheckboxIfPresent(page, label) {
 }
 
 // -----------------------------------------------------------------------------
-// Date picker (Date of Event).
+// Date and time pickers (Date of Event field).
 //
-// Per the live-form screenshot: the field is a chevron-combobox, NOT a text
-// input. .fill() is rejected because the input is not text-editable.
-// Clicking it opens a calendar popover with a Su/Mo/Tu/We/Th/Fr/Sa grid,
-// a "month year" header, "Today" link, and prev/next arrows.
-// We navigate to the target month using the arrows, then click the day number.
-// -----------------------------------------------------------------------------
-
-const MONTH_NAMES = [
-  'January', 'February', 'March', 'April', 'May', 'June',
-  'July', 'August', 'September', 'October', 'November', 'December',
-];
-
-function monthYearLabel(date) {
-  return MONTH_NAMES[date.getMonth()] + ' ' + date.getFullYear();
-}
-
-// Months between current displayed and target. Negative => navigate backward.
-function monthsBetween(displayed, target) {
-  return (target.getFullYear() - displayed.getFullYear()) * 12
-    + (target.getMonth() - displayed.getMonth());
-}
-
-async function pickDate(page, isoDate) {
-  if (!isoDate) return '';
-  const [year, month, day] = isoDate.split('-').map(Number);
-  const target = new Date(year, month - 1, day);
-
-  // Find the date combobox. The form has two side-by-side comboboxes ("Date
-  // of Event" cell contains a date and a time picker). We anchor to the
-  // first combobox inside the labeled card.
-  const card = page
-    .locator('div, section')
-    .filter({ has: page.getByText('Date of Event', { exact: true }) })
-    .first();
-
-  const dateCombo = card
-    .locator('input[placeholder*="mm/dd"]')
-    .or(card.getByRole('combobox').nth(0))
-    .first();
-
-  await dateCombo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
-  await dateCombo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
-
-  // Wait for the calendar popover. It's identifiable by the day-of-week
-  // headers ("Su Mo Tu We Th Fr Sa") -- specifically "Su" + "Sa" together.
-  const calendar = page
-    .locator('xpath=//*[.//*[normalize-space()="Su"] and .//*[normalize-space()="Sa"]]')
-    .last();
-  await calendar.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
-
-  // Read the displayed month/year from the calendar header.
-  const readDisplayedMonth = async () => {
-    const text = await calendar.evaluate((node) => {
-      // The header is a node containing "<MonthName> <year>" (e.g. "May 2026").
-      // It's not a heading element on this form -- just text near the top.
-      const monthRegex = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/;
-      // Walk text nodes, take the first match.
-      const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
-      let n;
-      while ((n = walker.nextNode())) {
-        const m = (n.textContent || '').match(monthRegex);
-        if (m) return m[0];
-      }
-      return null;
-    });
-    if (!text) return null;
-    const [name, yr] = text.split(/\s+/);
-    return new Date(Number(yr), MONTH_NAMES.indexOf(name), 1);
-  };
-
-  // Navigate using prev/next month arrows. They're the chevron buttons on
-  // either side of the calendar; we identify them by aria-label or by being
-  // the only buttons inside the calendar (excluding "Today" and the day cells).
-  const prev = calendar.getByRole('button', { name: /previous|prev|<|‹/i }).first();
-  const next = calendar.getByRole('button', { name: /next|>|›/i }).first();
-
-  // Some Airtable calendars don't aria-label these; fall back to the small
-  // arrow buttons by position.
-  const arrows = calendar.locator('button').filter({
-    hasNot: page.locator('text=/^(Today|\\d{1,2})$/'),
-  });
-
-  const clickAdvance = async (direction) => {
-    const labelled = direction === 'next' ? next : prev;
-    if (await labelled.isVisible({ timeout: 300 }).catch(() => false)) {
-      await labelled.click({ timeout: 2000, noWaitAfter: true });
-      return;
-    }
-    // Fallback: arrows[0] is prev, arrows[last] is next on this Airtable form.
-    const count = await arrows.count();
-    if (count >= 2) {
-      const idx = direction === 'next' ? count - 1 : 0;
-      await arrows.nth(idx).click({ timeout: 2000, noWaitAfter: true });
-      return;
-    }
-    throw new Error('Unable to locate calendar navigation arrows');
-  };
-
-  // Step toward the target month, capping iterations to avoid infinite loops.
-  for (let i = 0; i < 24; i++) {
-    const displayed = await readDisplayedMonth();
-    if (!displayed) break; // can't read; just try to click the day anyway
-    const diff = monthsBetween(displayed, target);
-    if (diff === 0) break;
-    await clickAdvance(diff > 0 ? 'next' : 'prev');
-    await page.waitForTimeout(120);
-  }
-
-  // Click the day number. Use exact match on the day text so we don't pick
-  // up a leading-zero version or the wrong cell.
-  const dayLocator = calendar
-    .getByRole('button', { name: String(day), exact: true })
-    .or(calendar.locator('xpath=.//*[normalize-space()="' + day + '"]'))
-    .first();
-  await dayLocator.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
-
-  // Wait for the popover to close so the next stage doesn't fight with it.
-  await page.waitForTimeout(250);
-  return isoDate;
-}
-
-// -----------------------------------------------------------------------------
-// Time picker (Time field, in the same Date of Event cell).
+// IMPORTANT: Although these LOOK like fancy comboboxes (calendar popover for
+// date, scrollable 30-min list for time), the underlying inputs ALSO accept
+// free-form typed values. Airtable's API stores them as a single ISO datetime
+// (e.g. "2026-05-14T10:17:00.000Z"), and arbitrary minute values like 10:17
+// are valid -- proof that picker-clicking isn't the only path.
 //
-// Per the live-form screenshot: clicking opens a scrollable list of times in
-// 30-minute increments, formatted as "h:mmam" / "h:mmpm" (lowercase, no
-// space, no leading zero on the hour).
+// The earlier .fill() approach failed with "waiting for element to be ...
+// editable". That's because Airtable's date/time inputs become editable only
+// after a focus/click. So the fix is: click first, then type the value, then
+// press Escape to dismiss any popover that opened, then verify the value
+// stuck. We do NOT navigate the calendar or scroll the time list.
+//
+// Format expected by the inputs:
+//   - Date: M/D/YYYY (the input shows "5/7/2026" in the live form, no
+//     leading zeros). MM/DD/YYYY also works.
+//   - Time: h:mmam / h:mmpm (lowercase, no space). 24-hour HH:MM may also
+//     parse but matching the picker's display format is safest.
 // -----------------------------------------------------------------------------
 
-function snapTo30Min(hh, mm) {
-  // Round mm to nearest 30. 0-14 => 0, 15-44 => 30, 45-59 => next hour.
-  let totalMin = hh * 60 + mm;
-  totalMin = Math.round(totalMin / 30) * 30;
-  if (totalMin >= 24 * 60) totalMin = 23 * 60 + 30;
-  return { hh: Math.floor(totalMin / 60), mm: totalMin % 60 };
+function airtableDateLabel(isoDate) {
+  // isoDate is "YYYY-MM-DD". We output "M/D/YYYY" without leading zeros to
+  // match the live form's display ("5/7/2026").
+  const [y, m, d] = isoDate.split('-').map(Number);
+  return m + '/' + d + '/' + y;
 }
 
 function airtableTimeLabel(hh24, mm) {
@@ -659,48 +548,51 @@ function airtableTimeLabel(hh24, mm) {
   return hh12 + ':' + mmStr + meridiem;
 }
 
+// Type a value into a focused combobox-style input, working around the
+// "not editable until focused" behavior. Returns the value that ended up
+// in the input.
+async function typeIntoComboboxInput(page, input, value) {
+  await input.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+  // Click to focus; this makes the input editable.
+  await input.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+
+  // Select all + delete to clear any existing value (handles cases where
+  // .fill('') is rejected because the input refuses programmatic clears).
+  await page.keyboard.press('Control+A').catch(() => undefined);
+  await page.keyboard.press('Delete').catch(() => undefined);
+
+  // type() with a small delay fires real keystroke events, which Airtable's
+  // React handlers listen for. .fill() bypasses these in some cases.
+  await input.type(String(value), { delay: 30 });
+
+  // Press Escape to close the calendar/time-list popover if it opened.
+  // Without this, the popover can swallow subsequent clicks on other fields.
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(150);
+
+  return input.inputValue().catch(() => '');
+}
+
+async function pickDate(page, isoDate) {
+  if (!isoDate) return '';
+  const label = airtableDateLabel(isoDate);
+
+  // Find the date input by placeholder. The form has two side-by-side combos
+  // in the Date of Event cell ("mm/dd/yyyy" and "hh:mm pm"); placeholder
+  // matching unambiguously picks the date one.
+  const input = page.locator('input[placeholder*="mm/dd"]').first();
+  const value = await typeIntoComboboxInput(page, input, label);
+  return value || label;
+}
+
 async function pickTime(page, hhmm) {
   if (!hhmm) return '';
-  const [rawH, rawM] = hhmm.split(':').map(Number);
-  const { hh, mm } = snapTo30Min(rawH, rawM);
-  const targetLabel = airtableTimeLabel(hh, mm);
+  const [hh24, mm] = hhmm.split(':').map(Number);
+  const label = airtableTimeLabel(hh24, mm);
 
-  const card = page
-    .locator('div, section')
-    .filter({ has: page.getByText('Date of Event', { exact: true }) })
-    .first();
-
-  // The time combobox is the second one in the cell (placeholder "hh:mm pm").
-  const timeCombo = card
-    .locator('input[placeholder*="hh:mm"]')
-    .or(card.getByRole('combobox').nth(1))
-    .first();
-
-  await timeCombo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
-  await timeCombo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
-
-  // Wait for the time list popover. We identify it by the presence of a
-  // "12:00am" entry (always the first item per the screenshot).
-  const popover = page
-    .locator('xpath=//*[.//*[normalize-space()="12:00am"]]')
-    .last();
-  await popover.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
-
-  // Find the target row and click. The list is virtualized/scrollable, so
-  // we may need to scroll the target into view first.
-  const targetRow = popover
-    .getByText(targetLabel, { exact: true })
-    .or(popover.locator('xpath=.//*[normalize-space()="' + targetLabel + '"]'))
-    .first();
-
-  if (!(await targetRow.isVisible({ timeout: 1500 }).catch(() => false))) {
-    // Scroll the target into view by scrolling the popover.
-    await targetRow.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
-  }
-
-  await targetRow.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
-  await page.waitForTimeout(200);
-  return targetLabel;
+  const input = page.locator('input[placeholder*="hh:mm"]').first();
+  const value = await typeIntoComboboxInput(page, input, label);
+  return value || label;
 }
 
 function artifactUrl(req, path) {
@@ -917,7 +809,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'date-time-picker-ui' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'date-time-typed-direct' });
 });
 
 async function submitObservationForm(req, res) {
