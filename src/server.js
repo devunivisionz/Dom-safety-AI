@@ -176,8 +176,12 @@ async function clickVisibleOption(page, value, timeout = 3000) {
     .or(page.getByText(new RegExp(escapeRegExp(value), 'i')))
     .first();
   if (!(await option.isVisible({ timeout }).catch(() => false))) return false;
-  await option.click();
-  return true;
+  try {
+    await option.click({ timeout });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function chooseCombo(page, label, value) {
@@ -201,7 +205,11 @@ async function chooseCombo(page, label, value) {
 
 async function chooseLinkedProject(page, value) {
   if (!value) return '';
-  const addButton = page.getByRole('button', { name: /add\s+project/i }).first();
+  const addButton = page
+    .getByRole('button', { name: /add\s+project/i })
+    .or(page.getByText(/^\s*\+?\s*Add\s+project\s*$/i))
+    .or(page.locator('[aria-label*="Add project" i]'))
+    .first();
   await addButton.scrollIntoViewIfNeeded();
   await addButton.click();
   if (await clickVisibleOption(page, value)) return value;
@@ -461,7 +469,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'visible-combo-option-click' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'short-option-click-timeout' });
 });
 
 async function submitObservationForm(req, res) {
