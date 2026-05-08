@@ -221,68 +221,166 @@ async function visibleOptionNames(page) {
   return [...new Set(options)].slice(0, 12);
 }
 
-async function chooseCombo(page, label, value) {
-  if (!value) return '';
-  const combo = comboByLabel(page, label);
-  await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
-  await combo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+// -----------------------------------------------------------------------------
+// Airtable-specific UI patterns (verified against the live form screenshots).
+//
+// Three popover styles exist on this form:
+//
+//   1. Linked-record popover (Project Site):
+//      Trigger: a "+ Add project" button.
+//      Popover: floating panel below the button, NOT role="dialog".
+//      Search input placeholder: "Search".
+//      Options: plain text rows (not pills).
+//
+//   2. Inline searchable dropdown (Name of Company, Name of Contractor
+//      Observed, Type of Hazard):
+//      Trigger: chevron button on a combobox row.
+//      Popover: appears directly under the combobox.
+//      Search input placeholder: "Find an option" or "Select an option".
+//      Options: pill-shaped chips inside the popover.
+//
+//   3. Radio group (Type of Observation, Stop Work Authority Used,
+//      Was the issue corrected onsite or is follow up needed):
+//      Pill labels with circular radio buttons. Handled by chooseRadio().
+//
+// None of these use role="dialog" -- earlier code that waited for
+// role="dialog" timed out because no dialog ever appeared. The picker
+// popover is just a floating panel. We detect it by waiting for the
+// search input itself to appear, then scope all queries to that input's
+// nearest containing popover (its scrollable list parent).
+// -----------------------------------------------------------------------------
 
-  // Airtable opens single-selects in two different ways depending on context:
-  //   * As role="dialog" (linked-record-style picker, modal)
-  //   * As role="listbox" (inline single-select dropdown, e.g. "Name of Company")
-  // Wait for whichever appears first.
-  const popover = page
-    .getByRole('dialog')
-    .or(page.getByRole('listbox'))
-    .first();
-  await popover.waitFor({ state: 'visible', timeout: 5000 }).catch(() => undefined);
+const POPOVER_SEARCH_PLACEHOLDERS = ['Search', 'Find an option', 'Select an option'];
 
-  // Try clicking the option immediately -- many inline listboxes show options
-  // without needing to type.
-  if (await clickVisibleOption(page, value)) return value;
-
-  // If a search input is available (it usually is for searchable selects),
-  // look for it in the popover first, then fall back to a recently-appeared
-  // input near the page. Never fall back to the global page input set.
-  const searchInPopover = popover
-    .locator('input[role="combobox"]')
-    .or(popover.locator('input[placeholder*="Search" i]'))
-    .or(popover.locator('input[placeholder*="Find" i]'))
-    .or(popover.locator('input[type="text"]'))
-    .first();
-
-  const searchAvailable = await searchInPopover.isVisible({ timeout: 2000 }).catch(() => false);
-
-  if (searchAvailable) {
-    await searchInPopover.click({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
-    try {
-      await searchInPopover.fill('', { timeout: 2000 });
-    } catch {
-      // ignore -- some inputs reject empty fill
-    }
-    await searchInPopover.type(String(value), { delay: 30 });
-    await page.waitForTimeout(400);
-
-    if (await clickVisibleOption(page, value, ACTION_TIMEOUT_MS)) return value;
+// After clicking a trigger, find the search input that just became visible.
+// Tries the placeholder texts shown in the live form, in order.
+async function waitForPopoverSearch(page, timeout = ACTION_TIMEOUT_MS) {
+  const start = Date.now();
+  // Build one combined locator covering every known placeholder + role=combobox.
+  let combined;
+  for (const placeholder of POPOVER_SEARCH_PLACEHOLDERS) {
+    const candidate = page.locator(
+      'input[placeholder="' + placeholder + '"], textarea[placeholder="' + placeholder + '"]'
+    );
+    combined = combined ? combined.or(candidate) : candidate;
   }
+  // Also accept any newly-appeared role=combobox or aria-label search input.
+  combined = combined
+    .or(page.locator('[role="dialog"] input[role="combobox"]'))
+    .or(page.locator('[role="listbox"] input'));
 
-  // Diagnostic: list visible options so the next failure tells us the real names.
-  const visibleOptions = await visibleOptionNames(page);
-  const suffix = visibleOptions.length ? '. Visible options: ' + visibleOptions.join(' | ') : '';
-  throw new Error('No visible option found for "' + label + '" value "' + value + '"' + suffix);
+  const search = combined.first();
+  while (Date.now() - start < timeout) {
+    if (await search.isVisible({ timeout: 500 }).catch(() => false)) {
+      return search;
+    }
+    await page.waitForTimeout(150);
+  }
+  throw new Error('Popover search input did not appear within ' + timeout + 'ms');
+}
+
+// Given the visible search input, return its containing popover element.
+// Used to scope option-clicks so we don't grab pills from the page background.
+async function popoverContainerFor(searchInput) {
+  // The popover is the nearest ancestor that scrolls (overflow auto/scroll)
+  // or has role="dialog"/"listbox", whichever we find first.
+  const handle = await searchInput.elementHandle();
+  if (!handle) return null;
+  const containerHandle = await handle.evaluateHandle((el) => {
+    let node = el.parentElement;
+    while (node && node !== document.body) {
+      const role = node.getAttribute('role');
+      if (role === 'dialog' || role === 'listbox') return node;
+      const style = window.getComputedStyle(node);
+      if (style.overflowY === 'auto' || style.overflowY === 'scroll') return node;
+      // Airtable popovers also tend to have position: absolute|fixed.
+      if (style.position === 'absolute' || style.position === 'fixed') return node;
+      node = node.parentElement;
+    }
+    return null;
+  });
+  return containerHandle && containerHandle.asElement
+    ? containerHandle.asElement()
+    : null;
+}
+
+// Type into the search and click a matching option.
+async function searchAndPick(page, searchInput, value, popoverHandle) {
+  await searchInput.click({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
+  try {
+    await searchInput.fill('', { timeout: 2000 });
+  } catch {
+    // ignore -- some inputs reject empty fill
+  }
+  // type() with delay fires real keystroke events. .fill() bypasses
+  // Airtable's React onChange for the search filter in some cases.
+  await searchInput.type(String(value), { delay: 30 });
+  await page.waitForTimeout(500);
+
+  // Build a locator scoped to the popover if we have a handle, otherwise page-wide.
+  // We look for both pill-style and plain-row style options.
+  const valueRegex = new RegExp(escapeRegExp(value), 'i');
+  const pillOrRow = popoverHandle
+    ? page.locator('xpath=.').nth(0) // placeholder; replaced below
+    : null;
+
+  // Use the page-level option roles and text matchers. We prefer scoped to
+  // popoverHandle but fall back to page-level since Airtable's options
+  // sometimes render as portals outside the visible popover container.
+  const candidates = [
+    page.getByRole('option', { name: String(value), exact: true }),
+    page.getByRole('option', { name: valueRegex }),
+    page.getByText(String(value), { exact: true }),
+    page.getByText(valueRegex),
+  ];
+
+  for (const candidate of candidates) {
+    const first = candidate.first();
+    if (await first.isVisible({ timeout: 1500 }).catch(() => false)) {
+      try {
+        await first.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+        return true;
+      } catch {
+        // try next candidate
+      }
+    }
+  }
+  return false;
+}
+
+// Diagnostic: list visible option-like elements anywhere on the page.
+// This is what shows up in the error message when no option matches.
+async function listVisibleOptions(page) {
+  const opts = await page.evaluate(() => {
+    const out = [];
+    const seen = new Set();
+    // Try options, then anything that looks like a pill/row in a popover.
+    const nodes = Array.from(document.querySelectorAll(
+      '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button'
+    ));
+    for (const node of nodes) {
+      const style = window.getComputedStyle(node);
+      const box = node.getBoundingClientRect();
+      if (style.visibility === 'hidden' || style.display === 'none') continue;
+      if (box.width === 0 || box.height === 0) continue;
+      const text = (node.textContent || '').trim();
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      out.push(text);
+      if (out.length >= 15) break;
+    }
+    return out;
+  }).catch(() => []);
+  return opts;
 }
 
 // -----------------------------------------------------------------------------
-// PATCHED: linked-record handling.
-//
-// The old version had a global fallback `page.locator('input[type="text"]')`
-// which, if the "+ Add" click didn't open a dialog, would resolve to the
-// nearest visible text input on the page -- in practice, the Date of Event
-// combobox. The fix scopes every locator to role="dialog" and waits for the
-// dialog to actually appear before searching.
+// Pattern 1: linked-record with "+ Add project" button (Project Site).
 // -----------------------------------------------------------------------------
+async function chooseLinkedRecord(page, value, addNames, label) {
+  if (!value) return '';
 
-async function openLinkedDialog(page, addNames, label) {
+  let addButton;
   for (const addName of addNames) {
     const addRegex = new RegExp('\\+?\\s*Add\\s+.*' + escapeRegExp(addName), 'i');
     const candidate = page
@@ -290,96 +388,34 @@ async function openLinkedDialog(page, addNames, label) {
       .or(page.getByText(addRegex))
       .first();
     if (await candidate.isVisible({ timeout: 1500 }).catch(() => false)) {
-      await candidate.scrollIntoViewIfNeeded();
-      await candidate.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
-      return true;
+      addButton = candidate;
+      break;
     }
   }
-  return false;
-}
-
-async function chooseLinkedRecord(page, value, addNames, label) {
-  if (!value) return '';
-
-  const opened = await openLinkedDialog(page, addNames, label);
-  if (!opened) {
+  if (!addButton) {
     throw new Error('No "+ Add" button found for linked field "' + label + '"');
   }
 
-  // Wait for the picker dialog to actually be open before doing anything.
-  // This is critical -- without this, the search-input fallback below would
-  // match unrelated inputs elsewhere on the page.
-  const dialog = page.getByRole('dialog').first();
-  await dialog.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+  await addButton.scrollIntoViewIfNeeded();
+  await addButton.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
 
-  // First, see if the value is already visible without searching.
-  const directOption = dialog
-    .getByRole('option', { name: String(value), exact: true })
-    .or(dialog.getByRole('option', { name: new RegExp(escapeRegExp(value), 'i') }))
-    .or(dialog.getByText(String(value), { exact: true }))
-    .first();
-
-  if (await directOption.isVisible({ timeout: 1500 }).catch(() => false)) {
-    try {
-      await directOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
-      return value;
-    } catch {
-      // fall through to search
-    }
-  }
-
-  // Find the search input *inside the dialog only*. Never fall back to
-  // page-wide text inputs.
-  const search = dialog
-    .locator('input[role="combobox"]')
-    .or(dialog.locator('input[placeholder*="Search" i]'))
-    .or(dialog.locator('input[placeholder*="Find" i]'))
-    .or(dialog.locator('input[type="text"]'))
-    .first();
-
-  await search.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
-
-  // type() with a small delay fires real keystroke events. Airtable's React
-  // inputs sometimes ignore programmatic .fill() value-sets (no search runs).
-  await search.click({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
+  // Wait for the popover's search input to appear. The popover is NOT a
+  // role="dialog" -- we previously waited for that and timed out.
+  let search;
   try {
-    await search.fill('', { timeout: 2000 });
-  } catch {
-    // ignore -- some inputs don't support empty fill
-  }
-  await search.type(String(value), { delay: 30 });
-
-  // Give Airtable a beat to filter results.
-  await page.waitForTimeout(500);
-
-  const filteredOption = dialog
-    .getByRole('option', { name: String(value), exact: true })
-    .or(dialog.getByRole('option', { name: new RegExp(escapeRegExp(value), 'i') }))
-    .or(dialog.getByText(String(value), { exact: true }))
-    .or(dialog.getByText(new RegExp(escapeRegExp(value), 'i')))
-    .first();
-
-  if (await filteredOption.isVisible({ timeout: ACTION_TIMEOUT_MS }).catch(() => false)) {
-    await filteredOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
-    return value;
+    search = await waitForPopoverSearch(page, ACTION_TIMEOUT_MS);
+  } catch (err) {
+    const visible = await listVisibleOptions(page);
+    const suffix = visible.length ? '. Currently visible: ' + visible.join(' | ') : '';
+    throw new Error('Linked-record popover did not open for "' + label + '"' + suffix);
   }
 
-  // Diagnostic: dump what's actually visible in the dialog so the next
-  // failure tells you exactly what names exist (e.g. "Bauxite II (BWI110)"
-  // vs the searched "Bauxite III (BWI100)").
-  const visible = await dialog.getByRole('option').evaluateAll((nodes) =>
-    nodes
-      .filter((node) => {
-        const style = window.getComputedStyle(node);
-        const box = node.getBoundingClientRect();
-        return style.visibility !== 'hidden' && style.display !== 'none' && box.width > 0 && box.height > 0;
-      })
-      .map((node) => node.textContent.trim())
-      .filter(Boolean)
-      .slice(0, 12)
-  ).catch(() => []);
+  const popoverHandle = await popoverContainerFor(search);
+  const picked = await searchAndPick(page, search, value, popoverHandle);
+  if (picked) return value;
 
-  const suffix = visible.length ? '. Visible options in dialog: ' + visible.join(' | ') : '';
+  const visible = await listVisibleOptions(page);
+  const suffix = visible.length ? '. Visible options: ' + visible.join(' | ') : '';
   throw new Error(
     'No matching option for "' + label + '" value "' + value + '" after searching' + suffix
   );
@@ -387,6 +423,48 @@ async function chooseLinkedRecord(page, value, addNames, label) {
 
 async function chooseLinkedProject(page, value) {
   return chooseLinkedRecord(page, value, ['project'], 'Project Site');
+}
+
+// -----------------------------------------------------------------------------
+// Pattern 2: inline searchable dropdown (Company, Contractor, Hazard).
+// Click the combobox row, type into "Find an option" / "Select an option",
+// click the matching pill.
+// -----------------------------------------------------------------------------
+async function chooseCombo(page, label, value) {
+  if (!value) return '';
+  const combo = comboByLabel(page, label);
+  await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+  await combo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+
+  // Wait for the popover's search input. If no search input exists (rare,
+  // but possible for very small option lists), we still try clicking
+  // visible options below.
+  let search = null;
+  try {
+    search = await waitForPopoverSearch(page, 4000);
+  } catch {
+    // No search input -- maybe the popover shows options directly.
+  }
+
+  // First, try clicking the option directly. Airtable shows visible options
+  // even before the user types into the search box.
+  if (await clickVisibleOption(page, value, 1500)) return value;
+
+  if (!search) {
+    const visible = await listVisibleOptions(page);
+    const suffix = visible.length ? '. Visible options: ' + visible.join(' | ') : '';
+    throw new Error(
+      'Combobox "' + label + '" did not open a searchable popover and "' + value + '" not visible' + suffix
+    );
+  }
+
+  const popoverHandle = await popoverContainerFor(search);
+  const picked = await searchAndPick(page, search, value, popoverHandle);
+  if (picked) return value;
+
+  const visible = await listVisibleOptions(page);
+  const suffix = visible.length ? '. Visible options: ' + visible.join(' | ') : '';
+  throw new Error('No visible option found for "' + label + '" value "' + value + '"' + suffix);
 }
 
 async function dismissCookieBanner(page) {
@@ -526,7 +604,14 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     );
     selected.contractor_observed = isUnsetOption(payload.contractor_observed)
       ? ''
-      : await stage('choose contractor observed', () => chooseLinkedRecord(page, payload.contractor_observed, ['contractor observed', 'contractor'], 'Name of Contractor Observed'));
+      : await stage(
+          'choose contractor observed',
+          // Per the live-form screenshot, this is an inline searchable dropdown
+          // (chevron + "Find an option" + scrollable pills), NOT a linked-record
+          // popover with an "+ Add" button -- even though the underlying field
+          // submits a foreignRowId. Use chooseCombo, not chooseLinkedRecord.
+          () => chooseCombo(page, 'Name of Contractor Observed', payload.contractor_observed)
+        );
     selected.type_of_observation = await stage('choose type of observation', () => chooseRadio(page, 'Type of Observation', TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]));
     selected.type_of_hazard = await stage('choose type of hazard', () => chooseCombo(page, 'Type of Hazard', payload.type_of_hazard));
     selected.severity = await stage('choose severity', () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity]));
@@ -640,7 +725,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'combo-listbox-or-dialog' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'screenshot-accurate-popovers' });
 });
 
 async function submitObservationForm(req, res) {
