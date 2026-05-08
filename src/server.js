@@ -511,6 +511,198 @@ async function checkCheckboxIfPresent(page, label) {
   return false;
 }
 
+// -----------------------------------------------------------------------------
+// Date picker (Date of Event).
+//
+// Per the live-form screenshot: the field is a chevron-combobox, NOT a text
+// input. .fill() is rejected because the input is not text-editable.
+// Clicking it opens a calendar popover with a Su/Mo/Tu/We/Th/Fr/Sa grid,
+// a "month year" header, "Today" link, and prev/next arrows.
+// We navigate to the target month using the arrows, then click the day number.
+// -----------------------------------------------------------------------------
+
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+];
+
+function monthYearLabel(date) {
+  return MONTH_NAMES[date.getMonth()] + ' ' + date.getFullYear();
+}
+
+// Months between current displayed and target. Negative => navigate backward.
+function monthsBetween(displayed, target) {
+  return (target.getFullYear() - displayed.getFullYear()) * 12
+    + (target.getMonth() - displayed.getMonth());
+}
+
+async function pickDate(page, isoDate) {
+  if (!isoDate) return '';
+  const [year, month, day] = isoDate.split('-').map(Number);
+  const target = new Date(year, month - 1, day);
+
+  // Find the date combobox. The form has two side-by-side comboboxes ("Date
+  // of Event" cell contains a date and a time picker). We anchor to the
+  // first combobox inside the labeled card.
+  const card = page
+    .locator('div, section')
+    .filter({ has: page.getByText('Date of Event', { exact: true }) })
+    .first();
+
+  const dateCombo = card
+    .locator('input[placeholder*="mm/dd"]')
+    .or(card.getByRole('combobox').nth(0))
+    .first();
+
+  await dateCombo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+  await dateCombo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+
+  // Wait for the calendar popover. It's identifiable by the day-of-week
+  // headers ("Su Mo Tu We Th Fr Sa") -- specifically "Su" + "Sa" together.
+  const calendar = page
+    .locator('xpath=//*[.//*[normalize-space()="Su"] and .//*[normalize-space()="Sa"]]')
+    .last();
+  await calendar.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+
+  // Read the displayed month/year from the calendar header.
+  const readDisplayedMonth = async () => {
+    const text = await calendar.evaluate((node) => {
+      // The header is a node containing "<MonthName> <year>" (e.g. "May 2026").
+      // It's not a heading element on this form -- just text near the top.
+      const monthRegex = /(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/;
+      // Walk text nodes, take the first match.
+      const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
+      let n;
+      while ((n = walker.nextNode())) {
+        const m = (n.textContent || '').match(monthRegex);
+        if (m) return m[0];
+      }
+      return null;
+    });
+    if (!text) return null;
+    const [name, yr] = text.split(/\s+/);
+    return new Date(Number(yr), MONTH_NAMES.indexOf(name), 1);
+  };
+
+  // Navigate using prev/next month arrows. They're the chevron buttons on
+  // either side of the calendar; we identify them by aria-label or by being
+  // the only buttons inside the calendar (excluding "Today" and the day cells).
+  const prev = calendar.getByRole('button', { name: /previous|prev|<|‹/i }).first();
+  const next = calendar.getByRole('button', { name: /next|>|›/i }).first();
+
+  // Some Airtable calendars don't aria-label these; fall back to the small
+  // arrow buttons by position.
+  const arrows = calendar.locator('button').filter({
+    hasNot: page.locator('text=/^(Today|\\d{1,2})$/'),
+  });
+
+  const clickAdvance = async (direction) => {
+    const labelled = direction === 'next' ? next : prev;
+    if (await labelled.isVisible({ timeout: 300 }).catch(() => false)) {
+      await labelled.click({ timeout: 2000, noWaitAfter: true });
+      return;
+    }
+    // Fallback: arrows[0] is prev, arrows[last] is next on this Airtable form.
+    const count = await arrows.count();
+    if (count >= 2) {
+      const idx = direction === 'next' ? count - 1 : 0;
+      await arrows.nth(idx).click({ timeout: 2000, noWaitAfter: true });
+      return;
+    }
+    throw new Error('Unable to locate calendar navigation arrows');
+  };
+
+  // Step toward the target month, capping iterations to avoid infinite loops.
+  for (let i = 0; i < 24; i++) {
+    const displayed = await readDisplayedMonth();
+    if (!displayed) break; // can't read; just try to click the day anyway
+    const diff = monthsBetween(displayed, target);
+    if (diff === 0) break;
+    await clickAdvance(diff > 0 ? 'next' : 'prev');
+    await page.waitForTimeout(120);
+  }
+
+  // Click the day number. Use exact match on the day text so we don't pick
+  // up a leading-zero version or the wrong cell.
+  const dayLocator = calendar
+    .getByRole('button', { name: String(day), exact: true })
+    .or(calendar.locator('xpath=.//*[normalize-space()="' + day + '"]'))
+    .first();
+  await dayLocator.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+
+  // Wait for the popover to close so the next stage doesn't fight with it.
+  await page.waitForTimeout(250);
+  return isoDate;
+}
+
+// -----------------------------------------------------------------------------
+// Time picker (Time field, in the same Date of Event cell).
+//
+// Per the live-form screenshot: clicking opens a scrollable list of times in
+// 30-minute increments, formatted as "h:mmam" / "h:mmpm" (lowercase, no
+// space, no leading zero on the hour).
+// -----------------------------------------------------------------------------
+
+function snapTo30Min(hh, mm) {
+  // Round mm to nearest 30. 0-14 => 0, 15-44 => 30, 45-59 => next hour.
+  let totalMin = hh * 60 + mm;
+  totalMin = Math.round(totalMin / 30) * 30;
+  if (totalMin >= 24 * 60) totalMin = 23 * 60 + 30;
+  return { hh: Math.floor(totalMin / 60), mm: totalMin % 60 };
+}
+
+function airtableTimeLabel(hh24, mm) {
+  const meridiem = hh24 >= 12 ? 'pm' : 'am';
+  let hh12 = hh24 % 12;
+  if (hh12 === 0) hh12 = 12;
+  const mmStr = String(mm).padStart(2, '0');
+  return hh12 + ':' + mmStr + meridiem;
+}
+
+async function pickTime(page, hhmm) {
+  if (!hhmm) return '';
+  const [rawH, rawM] = hhmm.split(':').map(Number);
+  const { hh, mm } = snapTo30Min(rawH, rawM);
+  const targetLabel = airtableTimeLabel(hh, mm);
+
+  const card = page
+    .locator('div, section')
+    .filter({ has: page.getByText('Date of Event', { exact: true }) })
+    .first();
+
+  // The time combobox is the second one in the cell (placeholder "hh:mm pm").
+  const timeCombo = card
+    .locator('input[placeholder*="hh:mm"]')
+    .or(card.getByRole('combobox').nth(1))
+    .first();
+
+  await timeCombo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+  await timeCombo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+
+  // Wait for the time list popover. We identify it by the presence of a
+  // "12:00am" entry (always the first item per the screenshot).
+  const popover = page
+    .locator('xpath=//*[.//*[normalize-space()="12:00am"]]')
+    .last();
+  await popover.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+
+  // Find the target row and click. The list is virtualized/scrollable, so
+  // we may need to scroll the target into view first.
+  const targetRow = popover
+    .getByText(targetLabel, { exact: true })
+    .or(popover.locator('xpath=.//*[normalize-space()="' + targetLabel + '"]'))
+    .first();
+
+  if (!(await targetRow.isVisible({ timeout: 1500 }).catch(() => false))) {
+    // Scroll the target into view by scrolling the popover.
+    await targetRow.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
+  }
+
+  await targetRow.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+  await page.waitForTimeout(200);
+  return targetLabel;
+}
+
 function artifactUrl(req, path) {
   if (!path) return '';
   const origin = req.protocol + '://' + req.get('host');
@@ -589,8 +781,8 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await stage('wait Airtable form ready', () => page.getByText(/Date\s+of\s+event/i).first().waitFor({ timeout: FORM_READY_TIMEOUT_MS }));
     await stage('dismiss cookie banner', () => dismissCookieBanner(page));
 
-    await stage('fill date', () => fillText(page, 'Date of Event', dateForAirtable(payload.date_of_event)));
-    await stage('fill time', () => fillText(page, 'Time', payload.time));
+    await stage('fill date', () => pickDate(page, payload.date_of_event));
+    await stage('fill time', () => pickTime(page, payload.time));
     selected.project_site = await stage('choose project site', () => chooseLinkedProject(page, payload.project_site));
     await stage('fill reporter name', () => fillText(page, 'Your Name (First and Last)', payload.reporter_name));
     await stage('fill reporter email', () => fillText(page, 'Your Email Address', payload.reporter_email));
@@ -725,7 +917,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'screenshot-accurate-popovers' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'date-time-picker-ui' });
 });
 
 async function submitObservationForm(req, res) {
