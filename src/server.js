@@ -144,7 +144,7 @@ function normalizeTime(value) {
 
 function dateForAirtable(date) {
   const [year, month, day] = date.split('-');
-  return day + '/' + month + '/' + year;
+  return month + '/' + day + '/' + year;
 }
 
 function escapeRegExp(value) {
@@ -172,7 +172,24 @@ function comboByLabel(page, label) {
 
 async function fillText(page, label, value) {
   if (!value) return;
-  await byLabel(page, label).fill(String(value));
+  const field = byLabel(page, label);
+  await field.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+  try {
+    await field.fill(String(value), { timeout: ACTION_TIMEOUT_MS });
+    return;
+  } catch {
+    await field.evaluate((element, nextValue) => {
+      const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+      if (setter) {
+        setter.call(element, nextValue);
+      } else {
+        element.value = nextValue;
+      }
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+    }, String(value));
+  }
 }
 
 async function clickVisibleOption(page, value, timeout = 3000) {
@@ -510,7 +527,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'no-wait-after-airtable-clicks' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'dom-fill-date-fields' });
 });
 
 async function submitObservationForm(req, res) {
