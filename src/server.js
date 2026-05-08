@@ -184,7 +184,7 @@ async function clickVisibleOption(page, value, timeout = 3000) {
     .first();
   if (!(await option.isVisible({ timeout }).catch(() => false))) return false;
   try {
-    await option.click({ timeout });
+    await option.click({ timeout, noWaitAfter: true });
     return true;
   } catch {
     return false;
@@ -208,7 +208,7 @@ async function chooseCombo(page, label, value) {
   if (!value) return '';
   const combo = comboByLabel(page, label);
   await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
-  await combo.click({ timeout: ACTION_TIMEOUT_MS });
+  await combo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
   if (await clickVisibleOption(page, value)) return value;
   const search = page
     .getByRole('combobox', { name: 'Find an option' })
@@ -244,7 +244,7 @@ async function chooseLinkedRecord(page, value, addNames, label) {
     throw new Error('No Add button found for linked field "' + label + '"');
   }
   await addButton.scrollIntoViewIfNeeded();
-  await addButton.click({ timeout: ACTION_TIMEOUT_MS });
+  await addButton.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
   if (await clickVisibleOption(page, value)) return value;
   const search = page
     .getByRole('combobox', { name: 'Search', exact: true })
@@ -510,7 +510,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'longer-linked-record-stages' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'no-wait-after-airtable-clicks' });
 });
 
 async function submitObservationForm(req, res) {
