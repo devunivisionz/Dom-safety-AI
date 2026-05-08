@@ -18,6 +18,7 @@ const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 10000);
 const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 45000);
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 30000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
+const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 85000);
 
 const DEFAULTS = {
   project_site: 'Bauxite III (BWI100)',
@@ -252,6 +253,21 @@ async function safeScreenshot(page, path) {
   }
 }
 
+function withTimeout(promise, timeoutMs, message) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
+function stageTimeout(name) {
+  if (name === 'launch browser') return 60000;
+  if (name === 'open Airtable form') return NAVIGATION_TIMEOUT_MS + FORM_READY_TIMEOUT_MS + 5000;
+  if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
+  return ACTION_TIMEOUT_MS + 5000;
+}
+
 async function fillForm(payload, req) {
   const tmpDir = await mkdtemp(join(tmpdir(), 'safety-observation-'));
   const selected = { ...payload.selected_values };
@@ -265,7 +281,7 @@ async function fillForm(payload, req) {
   const stage = async (name, fn) => {
     stageName = name;
     console.log('form-service stage: ' + name);
-    return fn();
+    return withTimeout(Promise.resolve().then(fn), stageTimeout(name), 'Timed out during stage "' + name + '"');
   };
 
   try {
@@ -346,8 +362,8 @@ async function fillForm(payload, req) {
     const afterPath = join(tmpDir, submitted ? 'after-submit.png' : 'test-filled.png');
     const finalScreenshot = await stage('capture final screenshot', () => safeScreenshot(page, afterPath));
 
-    await context.close();
-    await browser.close();
+    await withTimeout(context.close(), 5000, 'Timed out closing browser context').catch(() => undefined);
+    await withTimeout(browser.close(), 5000, 'Timed out closing browser').catch(() => undefined);
 
     return {
       success: true,
@@ -366,10 +382,10 @@ async function fillForm(payload, req) {
     const errorPath = join(tmpDir, 'error.png');
     const errorScreenshot = await safeScreenshot(page, errorPath);
     if (context) {
-      await context.close().catch(() => undefined);
+      await withTimeout(context.close(), 5000, 'Timed out closing browser context').catch(() => undefined);
     }
     if (browser) {
-      await browser.close().catch(() => undefined);
+      await withTimeout(browser.close(), 5000, 'Timed out closing browser').catch(() => undefined);
     }
 
     return {
@@ -388,6 +404,22 @@ async function fillForm(payload, req) {
   }
 }
 
+function timeoutResult(payload) {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      resolve({
+        success: false,
+        submitted: false,
+        test_mode: payload.test_mode,
+        selected_values: payload.selected_values,
+        failed_stage: 'request timeout',
+        error: 'Form automation exceeded ' + REQUEST_TIMEOUT_MS + 'ms before returning a result',
+        artifacts: {},
+      });
+    }, REQUEST_TIMEOUT_MS);
+  });
+}
+
 app.get('/', (req, res) => {
   res.json({
     ok: true,
@@ -398,7 +430,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'robust-project-picker' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'bounded-form-request' });
 });
 
 async function submitObservationForm(req, res) {
@@ -408,7 +440,7 @@ async function submitObservationForm(req, res) {
   }
 
   const payload = normalizePayload(req.body || {});
-  const result = await fillForm(payload, req);
+  const result = await Promise.race([fillForm(payload, req), timeoutResult(payload)]);
   res.status(200).json(result);
 }
 
