@@ -247,7 +247,7 @@ async function chooseLinkedRecord(page, value, addNames, label) {
   if (!value) return '';
   let addButton;
   for (const addName of addNames) {
-    const addRegex = new RegExp('^\\s*\\+?\\s*Add\\s+' + escapeRegExp(addName) + '\\s*$', 'i');
+    const addRegex = new RegExp('\\+?\\s*Add\\s+.*' + escapeRegExp(addName), 'i');
     const candidate = page
       .getByRole('button', { name: addRegex })
       .or(page.getByText(addRegex))
@@ -410,7 +410,15 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     selected.project_site = await stage('choose project site', () => chooseLinkedProject(page, payload.project_site));
     await stage('fill reporter name', () => fillText(page, 'Your Name (First and Last)', payload.reporter_name));
     await stage('fill reporter email', () => fillText(page, 'Your Email Address', payload.reporter_email));
-    selected.company_name = await stage('choose company', () => chooseLinkedRecord(page, payload.company_name, ['company'], 'Name of Company'));
+    selected.company_name = await stage(
+  'choose company',
+  () => chooseLinkedRecord(
+    page,
+    payload.company_name,
+    ['company', 'record', 'Name of Company'],
+    'Name of Company'
+  )
+);
     selected.contractor_observed = isUnsetOption(payload.contractor_observed)
       ? ''
       : await stage('choose contractor observed', () => chooseLinkedRecord(page, payload.contractor_observed, ['contractor observed', 'contractor'], 'Name of Contractor Observed'));
