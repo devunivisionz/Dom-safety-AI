@@ -263,12 +263,12 @@ function withTimeout(promise, timeoutMs, message) {
 
 function stageTimeout(name) {
   if (name === 'launch browser') return 60000;
-  if (name === 'open Airtable form') return NAVIGATION_TIMEOUT_MS + FORM_READY_TIMEOUT_MS + 5000;
+  if (name === 'open Airtable form') return 55000;
   if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
   return ACTION_TIMEOUT_MS + 5000;
 }
 
-async function fillForm(payload, req) {
+async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
   const tmpDir = await mkdtemp(join(tmpdir(), 'safety-observation-'));
   const selected = { ...payload.selected_values };
   let browser;
@@ -280,6 +280,7 @@ async function fillForm(payload, req) {
 
   const stage = async (name, fn) => {
     stageName = name;
+    tracker.stage = name;
     console.log('form-service stage: ' + name);
     return withTimeout(Promise.resolve().then(fn), stageTimeout(name), 'Timed out during stage "' + name + '"');
   };
@@ -404,7 +405,7 @@ async function fillForm(payload, req) {
   }
 }
 
-function timeoutResult(payload) {
+function timeoutResult(payload, tracker) {
   return new Promise((resolve) => {
     setTimeout(() => {
       resolve({
@@ -412,8 +413,8 @@ function timeoutResult(payload) {
         submitted: false,
         test_mode: payload.test_mode,
         selected_values: payload.selected_values,
-        failed_stage: 'request timeout',
-        error: 'Form automation exceeded ' + REQUEST_TIMEOUT_MS + 'ms before returning a result',
+        failed_stage: tracker.stage || 'request timeout',
+        error: 'Form automation exceeded ' + REQUEST_TIMEOUT_MS + 'ms before returning a result. Last stage: ' + (tracker.stage || 'unknown'),
         artifacts: {},
       });
     }, REQUEST_TIMEOUT_MS);
@@ -430,7 +431,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'bounded-form-request' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'tracked-form-timeout' });
 });
 
 async function submitObservationForm(req, res) {
@@ -440,7 +441,8 @@ async function submitObservationForm(req, res) {
   }
 
   const payload = normalizePayload(req.body || {});
-  const result = await Promise.race([fillForm(payload, req), timeoutResult(payload)]);
+  const tracker = { stage: 'queued' };
+  const result = await Promise.race([fillForm(payload, req, tracker), timeoutResult(payload, tracker)]);
   res.status(200).json(result);
 }
 
