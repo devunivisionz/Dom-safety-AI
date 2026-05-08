@@ -226,15 +226,25 @@ async function chooseCombo(page, label, value) {
   throw new Error('No visible option found for "' + label + '" value "' + value + '"' + suffix);
 }
 
-async function chooseLinkedProject(page, value) {
+async function chooseLinkedRecord(page, value, addNames, label) {
   if (!value) return '';
-  const addButton = page
-    .getByRole('button', { name: /add\s+project/i })
-    .or(page.getByText(/^\s*\+?\s*Add\s+project\s*$/i))
-    .or(page.locator('[aria-label*="Add project" i]'))
-    .first();
+  let addButton;
+  for (const addName of addNames) {
+    const addRegex = new RegExp('^\\s*\\+?\\s*Add\\s+' + escapeRegExp(addName) + '\\s*$', 'i');
+    const candidate = page
+      .getByRole('button', { name: addRegex })
+      .or(page.getByText(addRegex))
+      .first();
+    if (await candidate.isVisible({ timeout: 1500 }).catch(() => false)) {
+      addButton = candidate;
+      break;
+    }
+  }
+  if (!addButton) {
+    throw new Error('No Add button found for linked field "' + label + '"');
+  }
   await addButton.scrollIntoViewIfNeeded();
-  await addButton.click();
+  await addButton.click({ timeout: ACTION_TIMEOUT_MS });
   if (await clickVisibleOption(page, value)) return value;
   const search = page
     .getByRole('combobox', { name: 'Search', exact: true })
@@ -247,7 +257,13 @@ async function chooseLinkedProject(page, value) {
   await search.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
   await search.fill(String(value));
   if (await clickVisibleOption(page, value, ACTION_TIMEOUT_MS)) return value;
-  throw new Error('No visible project option found for "' + value + '"');
+  const visibleOptions = await visibleOptionNames(page);
+  const suffix = visibleOptions.length ? '. Visible options: ' + visibleOptions.join(', ') : '';
+  throw new Error('No visible linked option found for "' + label + '" value "' + value + '"' + suffix);
+}
+
+async function chooseLinkedProject(page, value) {
+  return chooseLinkedRecord(page, value, ['project'], 'Project Site');
 }
 
 async function dismissCookieBanner(page) {
@@ -376,10 +392,10 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     selected.project_site = await stage('choose project site', () => chooseLinkedProject(page, payload.project_site));
     await stage('fill reporter name', () => fillText(page, 'Your Name (First and Last)', payload.reporter_name));
     await stage('fill reporter email', () => fillText(page, 'Your Email Address', payload.reporter_email));
-    selected.company_name = await stage('choose company', () => chooseCombo(page, 'Name of Company', payload.company_name));
+    selected.company_name = await stage('choose company', () => chooseLinkedRecord(page, payload.company_name, ['company'], 'Name of Company'));
     selected.contractor_observed = isUnsetOption(payload.contractor_observed)
       ? ''
-      : await stage('choose contractor observed', () => chooseCombo(page, 'Name of Contractor Observed', payload.contractor_observed));
+      : await stage('choose contractor observed', () => chooseLinkedRecord(page, payload.contractor_observed, ['contractor observed', 'contractor'], 'Name of Contractor Observed'));
     selected.type_of_observation = await stage('choose type of observation', () => chooseRadio(page, 'Type of Observation', TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]));
     selected.type_of_hazard = await stage('choose type of hazard', () => chooseCombo(page, 'Type of Hazard', payload.type_of_hazard));
     selected.severity = await stage('choose severity', () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity]));
@@ -493,7 +509,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'nonblocking-airtable-network-idle' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'linked-company-fields' });
 });
 
 async function submitObservationForm(req, res) {
