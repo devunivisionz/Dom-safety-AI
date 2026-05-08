@@ -184,6 +184,11 @@ async function chooseLinkedProject(page, value) {
   const addButton = page.getByRole('button', { name: /add\s+project/i }).first();
   await addButton.scrollIntoViewIfNeeded();
   await addButton.click();
+  const visibleOption = page.getByText(String(value), { exact: true }).first();
+  if (await visibleOption.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await visibleOption.click();
+    return value;
+  }
   const search = page
     .getByRole('combobox', { name: 'Search', exact: true })
     .or(page.getByRole('combobox', { name: /search/i }))
@@ -445,7 +450,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'robust-linked-project-picker' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'direct-project-option-click' });
 });
 
 async function submitObservationForm(req, res) {
