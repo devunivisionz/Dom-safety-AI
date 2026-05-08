@@ -242,9 +242,17 @@ async function chooseCombo(page, label, value) {
   throw new Error('No visible option found for "' + label + '" value "' + value + '"' + suffix);
 }
 
-async function chooseLinkedRecord(page, value, addNames, label) {
-  if (!value) return '';
-  let addButton;
+// -----------------------------------------------------------------------------
+// PATCHED: linked-record handling.
+//
+// The old version had a global fallback `page.locator('input[type="text"]')`
+// which, if the "+ Add" click didn't open a dialog, would resolve to the
+// nearest visible text input on the page -- in practice, the Date of Event
+// combobox. The fix scopes every locator to role="dialog" and waits for the
+// dialog to actually appear before searching.
+// -----------------------------------------------------------------------------
+
+async function openLinkedDialog(page, addNames, label) {
   for (const addName of addNames) {
     const addRegex = new RegExp('\\+?\\s*Add\\s+.*' + escapeRegExp(addName), 'i');
     const candidate = page
@@ -252,30 +260,99 @@ async function chooseLinkedRecord(page, value, addNames, label) {
       .or(page.getByText(addRegex))
       .first();
     if (await candidate.isVisible({ timeout: 1500 }).catch(() => false)) {
-      addButton = candidate;
-      break;
+      await candidate.scrollIntoViewIfNeeded();
+      await candidate.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+      return true;
     }
   }
-  if (!addButton) {
-    throw new Error('No Add button found for linked field "' + label + '"');
+  return false;
+}
+
+async function chooseLinkedRecord(page, value, addNames, label) {
+  if (!value) return '';
+
+  const opened = await openLinkedDialog(page, addNames, label);
+  if (!opened) {
+    throw new Error('No "+ Add" button found for linked field "' + label + '"');
   }
-  await addButton.scrollIntoViewIfNeeded();
-  await addButton.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
-  if (await clickVisibleOption(page, value)) return value;
-  const search = page
-    .getByRole('combobox', { name: 'Search', exact: true })
-    .or(page.getByRole('combobox', { name: /search/i }))
-    .or(page.getByRole('combobox', { name: /find/i }))
-    .or(page.locator('input[placeholder*="Search" i]'))
-    .or(page.locator('input[placeholder*="Find" i]'))
-    .or(page.locator('input[type="text"]'))
+
+  // Wait for the picker dialog to actually be open before doing anything.
+  // This is critical -- without this, the search-input fallback below would
+  // match unrelated inputs elsewhere on the page.
+  const dialog = page.getByRole('dialog').first();
+  await dialog.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+
+  // First, see if the value is already visible without searching.
+  const directOption = dialog
+    .getByRole('option', { name: String(value), exact: true })
+    .or(dialog.getByRole('option', { name: new RegExp(escapeRegExp(value), 'i') }))
+    .or(dialog.getByText(String(value), { exact: true }))
     .first();
+
+  if (await directOption.isVisible({ timeout: 1500 }).catch(() => false)) {
+    try {
+      await directOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+      return value;
+    } catch {
+      // fall through to search
+    }
+  }
+
+  // Find the search input *inside the dialog only*. Never fall back to
+  // page-wide text inputs.
+  const search = dialog
+    .locator('input[role="combobox"]')
+    .or(dialog.locator('input[placeholder*="Search" i]'))
+    .or(dialog.locator('input[placeholder*="Find" i]'))
+    .or(dialog.locator('input[type="text"]'))
+    .first();
+
   await search.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
-  await search.fill(String(value));
-  if (await clickVisibleOption(page, value, ACTION_TIMEOUT_MS)) return value;
-  const visibleOptions = await visibleOptionNames(page);
-  const suffix = visibleOptions.length ? '. Visible options: ' + visibleOptions.join(', ') : '';
-  throw new Error('No visible linked option found for "' + label + '" value "' + value + '"' + suffix);
+
+  // type() with a small delay fires real keystroke events. Airtable's React
+  // inputs sometimes ignore programmatic .fill() value-sets (no search runs).
+  await search.click({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
+  try {
+    await search.fill('', { timeout: 2000 });
+  } catch {
+    // ignore -- some inputs don't support empty fill
+  }
+  await search.type(String(value), { delay: 30 });
+
+  // Give Airtable a beat to filter results.
+  await page.waitForTimeout(500);
+
+  const filteredOption = dialog
+    .getByRole('option', { name: String(value), exact: true })
+    .or(dialog.getByRole('option', { name: new RegExp(escapeRegExp(value), 'i') }))
+    .or(dialog.getByText(String(value), { exact: true }))
+    .or(dialog.getByText(new RegExp(escapeRegExp(value), 'i')))
+    .first();
+
+  if (await filteredOption.isVisible({ timeout: ACTION_TIMEOUT_MS }).catch(() => false)) {
+    await filteredOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+    return value;
+  }
+
+  // Diagnostic: dump what's actually visible in the dialog so the next
+  // failure tells you exactly what names exist (e.g. "Bauxite II (BWI110)"
+  // vs the searched "Bauxite III (BWI100)").
+  const visible = await dialog.getByRole('option').evaluateAll((nodes) =>
+    nodes
+      .filter((node) => {
+        const style = window.getComputedStyle(node);
+        const box = node.getBoundingClientRect();
+        return style.visibility !== 'hidden' && style.display !== 'none' && box.width > 0 && box.height > 0;
+      })
+      .map((node) => node.textContent.trim())
+      .filter(Boolean)
+      .slice(0, 12)
+  ).catch(() => []);
+
+  const suffix = visible.length ? '. Visible options in dialog: ' + visible.join(' | ') : '';
+  throw new Error(
+    'No matching option for "' + label + '" value "' + value + '" after searching' + suffix
+  );
 }
 
 async function chooseLinkedProject(page, value) {
@@ -410,14 +487,14 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await stage('fill reporter name', () => fillText(page, 'Your Name (First and Last)', payload.reporter_name));
     await stage('fill reporter email', () => fillText(page, 'Your Email Address', payload.reporter_email));
     selected.company_name = await stage(
-  'choose company',
-  () => chooseLinkedRecord(
-    page,
-    payload.company_name,
-    ['company', 'record', 'Name of Company'],
-    'Name of Company'
-  )
-);
+      'choose company',
+      () => chooseLinkedRecord(
+        page,
+        payload.company_name,
+        ['company', 'record', 'Name of Company'],
+        'Name of Company'
+      )
+    );
     selected.contractor_observed = isUnsetOption(payload.contractor_observed)
       ? ''
       : await stage('choose contractor observed', () => chooseLinkedRecord(page, payload.contractor_observed, ['contractor observed', 'contractor'], 'Name of Contractor Observed'));
@@ -534,7 +611,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'dom-fill-date-fields' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'linked-record-dialog-scoped' });
 });
 
 async function submitObservationForm(req, res) {
