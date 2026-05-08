@@ -56,7 +56,12 @@ function normalizeObservation(value) {
   const text = String(value || '').trim().toLowerCase();
   if (text.includes('unsafe condition')) return 'Unsafe Condition';
   if (text.includes('unsafe act')) return 'Unsafe Act';
-  return 'Positive/Safe Observation';
+  if (text.includes('positive') || text.includes('safe observation')) return 'Positive/Safe Observation';
+  // Default: when nothing matches, fall back to Unsafe Condition. We
+  // explicitly avoid defaulting to Positive/Safe Observation because that
+  // branch of the form has additional required fields (Positive/Safe
+  // Observation dropdown) which we don't currently support.
+  return 'Unsafe Condition';
 }
 
 function normalizeStopWork(value) {
@@ -306,27 +311,32 @@ async function popoverContainerFor(searchInput) {
 
 // Type into the search and click a matching option.
 async function searchAndPick(page, searchInput, value, popoverHandle) {
-  await searchInput.click({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
+  // Focus the input. Use focus() rather than click() if possible -- click
+  // can scroll/reflow the popover and disturb its position.
   try {
-    await searchInput.fill('', { timeout: 2000 });
+    await searchInput.focus({ timeout: ACTION_TIMEOUT_MS });
   } catch {
-    // ignore -- some inputs reject empty fill
+    await searchInput.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true }).catch(() => undefined);
   }
-  // type() with delay fires real keystroke events. .fill() bypasses
-  // Airtable's React onChange for the search filter in some cases.
-  await searchInput.type(String(value), { delay: 30 });
+
+  // Clear by selecting all + delete. Avoid .fill() on combobox-style inputs
+  // (they can reject programmatic value-sets via property setter).
+  await page.keyboard.press('Control+A').catch(() => undefined);
+  await page.keyboard.press('Delete').catch(() => undefined);
+
+  // CRITICAL: use page.keyboard.type() not searchInput.type().
+  //
+  // searchInput.type() re-checks actionability (visible/stable/enabled) on
+  // every keystroke. When Airtable's React re-renders the popover during
+  // typing -- which it does as filter results update -- the input briefly
+  // becomes unstable, and each keystroke retries until timeout.
+  //
+  // page.keyboard.type() just sends keystrokes to whatever has focus. No
+  // per-character actionability check, no retries, no timeout.
+  await page.keyboard.type(String(value), { delay: 30 });
   await page.waitForTimeout(500);
 
-  // Build a locator scoped to the popover if we have a handle, otherwise page-wide.
-  // We look for both pill-style and plain-row style options.
   const valueRegex = new RegExp(escapeRegExp(value), 'i');
-  const pillOrRow = popoverHandle
-    ? page.locator('xpath=.').nth(0) // placeholder; replaced below
-    : null;
-
-  // Use the page-level option roles and text matchers. We prefer scoped to
-  // popoverHandle but fall back to page-level since Airtable's options
-  // sometimes render as portals outside the visible popover container.
   const candidates = [
     page.getByRole('option', { name: String(value), exact: true }),
     page.getByRole('option', { name: valueRegex }),
@@ -561,9 +571,11 @@ async function typeIntoComboboxInput(page, input, value) {
   await page.keyboard.press('Control+A').catch(() => undefined);
   await page.keyboard.press('Delete').catch(() => undefined);
 
-  // type() with a small delay fires real keystroke events, which Airtable's
-  // React handlers listen for. .fill() bypasses these in some cases.
-  await input.type(String(value), { delay: 30 });
+  // Use page.keyboard.type() instead of input.type() -- input.type()
+  // re-checks actionability per keystroke, which can time out when Airtable's
+  // React re-renders the popover/dropdown during typing. page.keyboard.type()
+  // sends keystrokes to whatever has focus without per-character retry.
+  await page.keyboard.type(String(value), { delay: 30 });
 
   // Press Escape to close the calendar/time-list popover if it opened.
   // Without this, the popover can swallow subsequent clicks on other fields.
@@ -622,6 +634,37 @@ function withTimeout(promise, timeoutMs, message) {
     timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
+// -----------------------------------------------------------------------------
+// Conditional field detection.
+//
+// The form branches on "Type of Observation":
+//   - "Unsafe Act" / "Unsafe Condition" --> shows Type of Hazard, Severity
+//   - "Positive/Safe Observation"       --> shows a "Positive/Safe Observation"
+//                                          dropdown, hides Severity
+// Rather than hardcode the branching rules (which can change), we just
+// check whether each field's label is currently rendered before trying to
+// fill it. Fields that aren't visible are skipped silently.
+// -----------------------------------------------------------------------------
+
+async function isFieldVisible(page, label, timeout = 1500) {
+  const locator = page
+    .getByText(label, { exact: true })
+    .or(page.getByText(labelRegex(label)))
+    .first();
+  return locator.isVisible({ timeout }).catch(() => false);
+}
+
+// Run a stage only if the given field label is currently visible. Returns
+// the value the inner function returned, or null if the field was skipped.
+async function stageIfVisible(stage, name, label, page, fn) {
+  const visible = await isFieldVisible(page, label);
+  if (!visible) {
+    console.log('form-service skipping stage (field not visible): ' + name);
+    return null;
+  }
+  return stage(name, fn);
 }
 
 function stageTimeout(name) {
@@ -697,11 +740,43 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           () => chooseCombo(page, 'Name of Contractor Observed', payload.contractor_observed)
         );
     selected.type_of_observation = await stage('choose type of observation', () => chooseRadio(page, 'Type of Observation', TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]));
-    selected.type_of_hazard = await stage('choose type of hazard', () => chooseCombo(page, 'Type of Hazard', payload.type_of_hazard));
-    selected.severity = await stage('choose severity', () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity]));
+
+    // After choosing observation type, the form re-renders to show/hide
+    // branch-specific fields. Give it a beat.
+    await page.waitForTimeout(300);
+
+    // Type of Hazard and Severity are both visible on the Unsafe Act /
+    // Unsafe Condition branches (the only branches we support). We still
+    // wrap in stageIfVisible as a safety net in case the form changes.
+    selected.type_of_hazard = await stageIfVisible(
+      stage,
+      'choose type of hazard',
+      'Type of Hazard',
+      page,
+      () => chooseCombo(page, 'Type of Hazard', payload.type_of_hazard)
+    );
+
+    selected.severity = await stageIfVisible(
+      stage,
+      'choose severity',
+      'Severity',
+      page,
+      () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity])
+    );
+
     selected.confirmation_checked = await stage('check confirmation', () => checkCheckboxIfPresent(page, 'Please check this box'));
     selected.stop_work_authority_used = await stage('choose stop work authority', () => chooseRadio(page, 'Stop Work Authority Used?', STOP_WORK_LABELS[payload.stop_work_authority_used]));
-    await stage('fill description', () => fillText(page, 'Description of Event (original)', payload.description_of_event || payload.positive_safe_observation));
+
+    // Description of Event: the field label may be "Description of Event" or
+    // "Description of Event (original)" depending on form variant. Try both.
+    await stage('fill description', async () => {
+      const text = payload.description_of_event || payload.positive_safe_observation;
+      if (!text) return;
+      const visibleA = await isFieldVisible(page, 'Description of Event (original)');
+      const labelToUse = visibleA ? 'Description of Event (original)' : 'Description of Event';
+      await fillText(page, labelToUse, text);
+    });
+
     await stage('fill corrective action', () => fillText(page, 'Corrective Action', payload.corrective_action));
     selected.followup_status = await stage('choose follow-up status', () => chooseRadio(page, 'Was the issue corrected onsite or is follow up needed?', FOLLOW_UP_LABELS[payload.followup_status]));
 
@@ -809,7 +884,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'date-time-typed-direct' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'unsafe-only-skip-positive' });
 });
 
 async function submitObservationForm(req, res) {
@@ -819,6 +894,25 @@ async function submitObservationForm(req, res) {
   }
 
   const payload = normalizePayload(req.body || {});
+
+  // The "Positive/Safe Observation" branch reveals an extra required
+  // dropdown ("Positive/Safe Observation") that we don't currently handle.
+  // Reject it explicitly so the caller knows why -- better than letting it
+  // spin up a browser and fail mid-form.
+  if (payload.type_of_observation === 'Positive/Safe Observation') {
+    res.status(200).json({
+      success: false,
+      submitted: false,
+      test_mode: payload.test_mode,
+      selected_values: payload.selected_values,
+      failed_stage: 'pre-flight',
+      error: 'Positive/Safe Observation branch is not currently supported. ' +
+        'Send type_of_observation as "Unsafe Act" or "Unsafe Condition".',
+      artifacts: {},
+    });
+    return;
+  }
+
   const tracker = { stage: 'queued' };
   const result = await Promise.race([fillForm(payload, req, tracker), timeoutResult(payload, tracker)]);
   res.status(200).json(result);
