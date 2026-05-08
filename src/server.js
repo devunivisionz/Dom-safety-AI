@@ -18,7 +18,7 @@ const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 10000);
 const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 45000);
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 30000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
-const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 85000);
+const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 155000);
 
 const DEFAULTS = {
   project_site: 'Bauxite III (BWI100)',
@@ -181,14 +181,25 @@ async function chooseCombo(page, label, value) {
 
 async function chooseLinkedProject(page, value) {
   if (!value) return '';
-  await page.getByRole('button', { name: /add\s+project/i }).first().click();
+  const addButton = page.getByRole('button', { name: /add\s+project/i }).first();
+  await addButton.scrollIntoViewIfNeeded();
+  await addButton.click();
   const search = page
     .getByRole('combobox', { name: 'Search', exact: true })
     .or(page.getByRole('combobox', { name: /search/i }))
+    .or(page.getByRole('combobox', { name: /find/i }))
+    .or(page.locator('input[placeholder*="Search" i]'))
+    .or(page.locator('input[placeholder*="Find" i]'))
+    .or(page.locator('input[type="text"]'))
     .first();
+  await search.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
   await search.fill(String(value));
-  const option = page.getByRole('option', { name: String(value), exact: true });
-  await option.click();
+  const option = page
+    .getByRole('option', { name: String(value), exact: true })
+    .or(page.getByRole('option', { name: new RegExp(escapeRegExp(value), 'i') }))
+    .or(page.getByText(new RegExp(escapeRegExp(value), 'i')))
+    .first();
+  await option.click({ timeout: ACTION_TIMEOUT_MS });
   return value;
 }
 
@@ -434,7 +445,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'split-form-open-stages' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'robust-linked-project-picker' });
 });
 
 async function submitObservationForm(req, res) {
