@@ -246,7 +246,11 @@ function artifactUrl(req, path) {
 async function safeScreenshot(page, path) {
   if (!page) return '';
   try {
-    await page.screenshot({ path, fullPage: false, timeout: SCREENSHOT_TIMEOUT_MS });
+    await withTimeout(
+      page.screenshot({ path, fullPage: false, timeout: SCREENSHOT_TIMEOUT_MS }),
+      SCREENSHOT_TIMEOUT_MS + 1000,
+      'Timed out capturing screenshot'
+    );
     return path;
   } catch {
     return '';
@@ -263,7 +267,8 @@ function withTimeout(promise, timeoutMs, message) {
 
 function stageTimeout(name) {
   if (name === 'launch browser') return 60000;
-  if (name === 'open Airtable form') return 55000;
+  if (name === 'navigate Airtable form') return NAVIGATION_TIMEOUT_MS + 5000;
+  if (name === 'wait Airtable form ready') return FORM_READY_TIMEOUT_MS + 5000;
   if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
   return ACTION_TIMEOUT_MS + 5000;
 }
@@ -302,12 +307,10 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     page.setDefaultTimeout(ACTION_TIMEOUT_MS);
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
 
-    await stage('open Airtable form', async () => {
-      await page.goto(FORM_URL, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
-      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
-      await page.getByText(/Date\s+of\s+event/i).first().waitFor({ timeout: FORM_READY_TIMEOUT_MS });
-      await dismissCookieBanner(page);
-    });
+    await stage('navigate Airtable form', () => page.goto(FORM_URL, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS }));
+    await stage('wait Airtable network idle', () => page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined));
+    await stage('wait Airtable form ready', () => page.getByText(/Date\s+of\s+event/i).first().waitFor({ timeout: FORM_READY_TIMEOUT_MS }));
+    await stage('dismiss cookie banner', () => dismissCookieBanner(page));
 
     await stage('fill date', () => fillText(page, 'Date of Event', dateForAirtable(payload.date_of_event)));
     await stage('fill time', () => fillText(page, 'Time', payload.time));
@@ -431,7 +434,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'tracked-form-timeout' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'split-form-open-stages' });
 });
 
 async function submitObservationForm(req, res) {
