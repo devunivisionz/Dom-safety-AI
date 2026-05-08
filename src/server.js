@@ -163,6 +163,13 @@ function byLabel(page, label) {
     .first();
 }
 
+function comboByLabel(page, label) {
+  return byLabel(page, label)
+    .or(page.getByRole('combobox', { name: label, exact: true }))
+    .or(page.getByRole('combobox', { name: labelRegex(label) }))
+    .first();
+}
+
 async function fillText(page, label, value) {
   if (!value) return;
   await byLabel(page, label).fill(String(value));
@@ -184,10 +191,24 @@ async function clickVisibleOption(page, value, timeout = 3000) {
   }
 }
 
+async function visibleOptionNames(page) {
+  const options = await page.getByRole('option').evaluateAll((nodes) => nodes
+    .filter((node) => {
+      const style = window.getComputedStyle(node);
+      const box = node.getBoundingClientRect();
+      return style.visibility !== 'hidden' && style.display !== 'none' && box.width > 0 && box.height > 0;
+    })
+    .map((node) => node.textContent.trim())
+    .filter(Boolean)
+  ).catch(() => []);
+  return [...new Set(options)].slice(0, 12);
+}
+
 async function chooseCombo(page, label, value) {
   if (!value) return '';
-  const combo = byLabel(page, label);
-  await combo.click();
+  const combo = comboByLabel(page, label);
+  await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+  await combo.click({ timeout: ACTION_TIMEOUT_MS });
   if (await clickVisibleOption(page, value)) return value;
   const search = page
     .getByRole('combobox', { name: 'Find an option' })
@@ -200,7 +221,9 @@ async function chooseCombo(page, label, value) {
   await search.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
   await search.fill(String(value));
   if (await clickVisibleOption(page, value, ACTION_TIMEOUT_MS)) return value;
-  throw new Error('No visible option found for "' + label + '" value "' + value + '"');
+  const visibleOptions = await visibleOptionNames(page);
+  const suffix = visibleOptions.length ? '. Visible options: ' + visibleOptions.join(', ') : '';
+  throw new Error('No visible option found for "' + label + '" value "' + value + '"' + suffix);
 }
 
 async function chooseLinkedProject(page, value) {
@@ -469,7 +492,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'short-option-click-timeout' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'combo-role-locator-diagnostics' });
 });
 
 async function submitObservationForm(req, res) {
