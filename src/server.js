@@ -486,14 +486,13 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     selected.project_site = await stage('choose project site', () => chooseLinkedProject(page, payload.project_site));
     await stage('fill reporter name', () => fillText(page, 'Your Name (First and Last)', payload.reporter_name));
     await stage('fill reporter email', () => fillText(page, 'Your Email Address', payload.reporter_email));
+    // "Name of Company" is a single-select dropdown, NOT a linked record.
+    // The captured Airtable payload shows it submits a `sel...` option ID
+    // (e.g. "selWXBQs2c3QUZHU8"), not a `rec...` linked-record ID. There's
+    // no "+ Add" button -- it's a regular combobox like Type of Hazard.
     selected.company_name = await stage(
       'choose company',
-      () => chooseLinkedRecord(
-        page,
-        payload.company_name,
-        ['company', 'record', 'Name of Company'],
-        'Name of Company'
-      )
+      () => chooseCombo(page, 'Name of Company', payload.company_name)
     );
     selected.contractor_observed = isUnsetOption(payload.contractor_observed)
       ? ''
@@ -611,7 +610,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'linked-record-dialog-scoped' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'company-as-single-select' });
 });
 
 async function submitObservationForm(req, res) {
