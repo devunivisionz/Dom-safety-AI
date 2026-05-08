@@ -228,13 +228,12 @@ async function chooseCombo(page, label, value) {
   await combo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
   if (await clickVisibleOption(page, value)) return value;
   const search = page
-    .getByRole('combobox', { name: 'Find an option' })
-    .or(page.getByRole('combobox', { name: /find/i }))
-    .or(page.getByRole('combobox', { name: /search/i }))
-    .or(page.locator('input[placeholder*="Find" i]'))
-    .or(page.locator('input[placeholder*="Search" i]'))
-    .or(page.locator('input[type="text"]'))
+    .locator('[role="dialog"] input[role="combobox"]')
+    .or(page.locator('[role="dialog"] input[placeholder*="Search" i]'))
+    .or(page.locator('[role="dialog"] input[placeholder*="Find" i]'))
+    .or(page.locator('[data-testid*="linkedRecord"] input[type="text"]'))
     .first();
+
   await search.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
   await search.fill(String(value));
   if (await clickVisibleOption(page, value, ACTION_TIMEOUT_MS)) return value;
