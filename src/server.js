@@ -344,6 +344,7 @@ function stageTimeout(name) {
   if (name === 'navigate Airtable form') return NAVIGATION_TIMEOUT_MS + 5000;
   if (name === 'wait Airtable network idle') return 25000;
   if (name === 'wait Airtable form ready') return FORM_READY_TIMEOUT_MS + 5000;
+  if (name === 'choose project site' || name === 'choose company' || name === 'choose contractor observed') return 45000;
   if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
   return ACTION_TIMEOUT_MS + 5000;
 }
@@ -509,7 +510,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'linked-company-fields' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'longer-linked-record-stages' });
 });
 
 async function submitObservationForm(req, res) {
