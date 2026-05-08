@@ -326,6 +326,7 @@ function withTimeout(promise, timeoutMs, message) {
 function stageTimeout(name) {
   if (name === 'launch browser') return 60000;
   if (name === 'navigate Airtable form') return NAVIGATION_TIMEOUT_MS + 5000;
+  if (name === 'wait Airtable network idle') return 25000;
   if (name === 'wait Airtable form ready') return FORM_READY_TIMEOUT_MS + 5000;
   if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
   return ACTION_TIMEOUT_MS + 5000;
@@ -492,7 +493,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'combo-role-locator-diagnostics' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'nonblocking-airtable-network-idle' });
 });
 
 async function submitObservationForm(req, res) {
