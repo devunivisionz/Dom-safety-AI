@@ -739,11 +739,41 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           // submits a foreignRowId. Use chooseCombo, not chooseLinkedRecord.
           () => chooseCombo(page, 'Name of Contractor Observed', payload.contractor_observed)
         );
-    selected.type_of_observation = await stage('choose type of observation', () => chooseRadio(page, 'Type of Observation', TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]));
+        selected.type_of_observation = await stage('choose type of observation', () => chooseRadio(page, 'Type of Observation', TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]));
 
     // After choosing observation type, the form re-renders to show/hide
     // branch-specific fields. Give it a beat.
     await page.waitForTimeout(300);
+
+    // Positive/Safe Observation dropdown (only appears for Positive/Safe Observation type)
+    selected.positive_safe_observation = await stageIfVisible(
+      stage,
+      'choose positive/safe observation',
+      'Positive/Safe Observation',
+      page,
+      () => chooseCombo(page, 'Positive/Safe Observation', payload.positive_safe_observation)
+    );
+
+    // Type of Hazard and Severity are only visible on Unsafe Act / Unsafe Condition branches
+    // selected.type_of_hazard = await stageIfVisible(
+    //   stage,
+    //   'choose type of hazard',
+    //   'Type of Hazard',
+    //   page,
+    //   () => chooseCombo(page, 'Type of Hazard', payload.type_of_hazard)
+    // );
+
+    // selected.severity = await stageIfVisible(
+    //   stage,
+    //   'choose severity',
+    //   'Severity',
+    //   page,
+    //   () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity])
+    // );
+
+    // After choosing observation type, the form re-renders to show/hide
+    // branch-specific fields. Give it a beat.
+    // await page.waitForTimeout(300);
 
     // Type of Hazard and Severity are both visible on the Unsafe Act /
     // Unsafe Condition branches (the only branches we support). We still
@@ -899,19 +929,19 @@ async function submitObservationForm(req, res) {
   // dropdown ("Positive/Safe Observation") that we don't currently handle.
   // Reject it explicitly so the caller knows why -- better than letting it
   // spin up a browser and fail mid-form.
-  if (payload.type_of_observation === 'Positive/Safe Observation') {
-    res.status(200).json({
-      success: false,
-      submitted: false,
-      test_mode: payload.test_mode,
-      selected_values: payload.selected_values,
-      failed_stage: 'pre-flight',
-      error: 'Positive/Safe Observation branch is not currently supported. ' +
-        'Send type_of_observation as "Unsafe Act" or "Unsafe Condition".',
-      artifacts: {},
-    });
-    return;
-  }
+  // if (payload.type_of_observation === 'Positive/Safe Observation') {
+  //   res.status(200).json({
+  //     success: false,
+  //     submitted: false,
+  //     test_mode: payload.test_mode,
+  //     selected_values: payload.selected_values,
+  //     failed_stage: 'pre-flight',
+  //     error: 'Positive/Safe Observation branch is not currently supported. ' +
+  //       'Send type_of_observation as "Unsafe Act" or "Unsafe Condition".',
+  //     artifacts: {},
+  //   });
+  //   return;
+  // }
 
   const tracker = { stage: 'queued' };
   const result = await Promise.race([fillForm(payload, req, tracker), timeoutResult(payload, tracker)]);
