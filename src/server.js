@@ -1259,18 +1259,65 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v7-time-direct-setter-observation-fallback' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v8-debug-payload-logs' });
 });
 
+function safeLogPayload(label, data) {
+  const copy = JSON.parse(JSON.stringify(data || {}));
+
+  if (copy.photo_base64) {
+    copy.photo_base64 = '[base64 hidden, length=' + String(data.photo_base64 || '').length + ']';
+  }
+
+  if (copy.photo_url) {
+    copy.photo_url = '[photo_url present]';
+  }
+
+  console.log(label, JSON.stringify(copy, null, 2));
+}
 async function submitObservationForm(req, res) {
   if (TOKEN && req.get('authorization') !== 'Bearer ' + TOKEN) {
     res.status(401).json({ success: false, error: 'Unauthorized' });
     return;
   }
 
+  console.log('================ FORM REQUEST START ================');
+  console.log('request timestamp:', new Date().toISOString());
+  console.log('submit_mode:', SUBMIT_MODE);
+
+  safeLogPayload('[RAW BODY FROM N8N]', req.body || {});
+
   const payload = normalizePayload(req.body || {});
+
+  safeLogPayload('[NORMALIZED PAYLOAD USED BY SCRIPT]', payload);
+
+  console.log('[PAYLOAD CHECK]', JSON.stringify({
+    raw_project_site: req.body?.project_site,
+    normalized_project_site: payload.project_site,
+
+    raw_type_of_observation: req.body?.type_of_observation,
+    normalized_type_of_observation: payload.type_of_observation,
+
+    raw_positive_safe_observation: req.body?.positive_safe_observation,
+    normalized_positive_safe_observation: payload.positive_safe_observation,
+
+    raw_test_mode: req.body?.test_mode,
+    normalized_test_mode: payload.test_mode,
+
+    submit_mode: SUBMIT_MODE,
+  }, null, 2));
+
   const tracker = { stage: 'queued' };
-  const result = await Promise.race([fillForm(payload, req, tracker), timeoutResult(payload, tracker)]);
+
+  const result = await Promise.race([
+    fillForm(payload, req, tracker),
+    timeoutResult(payload, tracker),
+  ]);
+
+  safeLogPayload('[FINAL RESULT]', result);
+
+  console.log('================ FORM REQUEST END ==================');
+
   res.status(200).json(result);
 }
 
