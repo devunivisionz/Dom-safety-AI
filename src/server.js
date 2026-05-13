@@ -737,111 +737,44 @@ async function waitForNewInput(page, alreadyVisible, timeoutMs = 3000) {
   return null;
 }
 
-async function pickDate(page, isoDate) {
-  if (!isoDate) return '';
-  const label = airtableDateLabel(isoDate);
-  try {
-    // Count inputs before clicking so we can detect the new one
-    const before = await page.locator('input:visible').count().catch(() => 0);
+async function fillInputByPlaceholder(page, placeholderPart, value) {
+  if (!value) return '';
 
-    // Click the date cell
-    const clicked = await clickDateTimeCell(page, [
-      'Fecha del evento', 'Date of Event', 'Date of event',
-    ]);
+  const input = page
+    .locator(`input[placeholder*="${placeholderPart}"]`)
+    .first();
 
-    // After clicking, wait briefly for an input to appear
-    await page.waitForTimeout(400);
-
-    // Try every visible input -- the date input is likely the first one
-    // or the one that wasn't there before
-    const inputs = await page.locator('input:visible').all().catch(() => []);
-
-    let typed = false;
-    for (const inp of inputs) {
-      try {
-        await inp.scrollIntoViewIfNeeded({ timeout: 1000 });
-        await page.keyboard.press('Control+A');
-        await page.keyboard.press('Delete');
-        await page.keyboard.type(label, { delay: 30 });
-        await page.keyboard.press('Escape');
-        typed = true;
-        break;
-      } catch { /* try next */ }
-    }
-
-    if (!typed) {
-      // Last resort: just type blind -- whatever has focus after clicking
-      await page.keyboard.press('Control+A');
-      await page.keyboard.press('Delete');
-      await page.keyboard.type(label, { delay: 30 });
-      await page.keyboard.press('Escape');
-    }
-
-    await page.waitForTimeout(200);
-    console.log('[pickDate] typed:', label);
-    return label;
-  } catch (e) {
-    console.warn('[pickDate] skipped:', e.message);
+  if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) {
+    console.warn(`[${placeholderPart}] input not visible, skipping`);
     return '';
   }
+
+  await input.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => undefined);
+  await input.click({ timeout: 5000, noWaitAfter: true });
+
+  await page.keyboard.press('Control+A').catch(() => undefined);
+  await page.keyboard.press('Delete').catch(() => undefined);
+  await page.keyboard.type(String(value), { delay: 20 });
+  await page.keyboard.press('Escape').catch(() => undefined);
+
+  await page.waitForTimeout(200);
+  return value;
+}
+
+async function pickDate(page, isoDate) {
+  if (!isoDate) return '';
+
+  const label = airtableDateLabel(isoDate); // M/D/YYYY
+  return fillInputByPlaceholder(page, 'mm/dd', label);
 }
 
 async function pickTime(page, hhmm) {
   if (!hhmm) return '';
+
   const [hh24, mm] = hhmm.split(':').map(Number);
-  const label = airtableTimeLabel(hh24, mm);
-  try {
-    // The time picker sits next to the date picker inside the same row.
-    // After filling the date, focus may still be in the date input.
-    // We Tab once to move to the time input, or click the time cell directly.
-
-    // Try Tab first (fast path when date was just filled)
-    await page.keyboard.press('Tab');
-    await page.waitForTimeout(300);
-
-    // Check if a time-like input is now focused
-    const focused = await page.evaluate(() => {
-      const el = document.activeElement;
-      if (!el) return null;
-      return { tag: el.tagName, placeholder: el.placeholder || '', value: el.value || '' };
-    }).catch(() => null);
-
-    if (focused && focused.tag === 'INPUT') {
-      await page.keyboard.press('Control+A');
-      await page.keyboard.press('Delete');
-      await page.keyboard.type(label, { delay: 30 });
-      await page.keyboard.press('Escape');
-      await page.waitForTimeout(200);
-      console.log('[pickTime] typed via Tab:', label);
-      return label;
-    }
-
-    // Fallback: click the time cell by finding it near the date label
-    const clicked = await clickDateTimeCell(page, [
-      '10:', ':', 'am', 'pm', // time value patterns already on screen
-    ]);
-    await page.waitForTimeout(300);
-
-    const inputs = await page.locator('input:visible').all().catch(() => []);
-    // Time input is typically the second visible input (date is first)
-    const timeInput = inputs[1] || inputs[0];
-    if (timeInput) {
-      await timeInput.scrollIntoViewIfNeeded({ timeout: 1000 });
-      await page.keyboard.press('Control+A');
-      await page.keyboard.press('Delete');
-      await page.keyboard.type(label, { delay: 30 });
-      await page.keyboard.press('Escape');
-    }
-
-    await page.waitForTimeout(200);
-    console.log('[pickTime] typed:', label);
-    return label;
-  } catch (e) {
-    console.warn('[pickTime] skipped:', e.message);
-    return '';
-  }
+  const label = airtableTimeLabel(hh24, mm); // h:mmam / h:mmpm
+  return fillInputByPlaceholder(page, 'hh:mm', label);
 }
-
 
 function artifactUrl(req, path) {
   if (!path) return '';
