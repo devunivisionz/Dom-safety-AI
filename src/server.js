@@ -104,6 +104,15 @@ function isUnsetOption(value) {
 }
 
 function normalizePayload(body) {
+  function toBoolean(value, defaultValue = true) {
+  if (value === true || value === false) return value;
+  const text = String(value ?? '').trim().toLowerCase();
+
+  if (['false', '0', 'no', 'off', 'live'].includes(text)) return false;
+  if (['true', '1', 'yes', 'on', 'test'].includes(text)) return true;
+
+  return defaultValue;
+}
   const dateTime = splitDateTime(body.date_of_event, body.time);
   const observation = normalizeObservation(body.type_of_observation);
   const severity = normalizeSeverity(body.severity);
@@ -111,7 +120,7 @@ function normalizePayload(body) {
   const followUp = normalizeFollowUp(body.followup_status);
 
   return {
-    test_mode:                body.test_mode !== false,
+   test_mode: toBoolean(body.test_mode, true),
     date_of_event:            dateTime.date,
     time:                     dateTime.time,
     project_site:             clean(body.project_site) || DEFAULTS.project_site,
@@ -348,44 +357,88 @@ async function dismissOpenPopover(page) {
 }
 
 async function chooseLinkedRecord(page, value, addNames, label) {
-  if (!value) return '';
+  if (!value || isUnsetOption(value)) return '';
 
-  let addButton;
+  const fieldLabel = page
+    .getByText(label, { exact: true })
+    .or(page.getByText(labelRegex(label)))
+    .first();
+
+  await fieldLabel.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
+
+  let addButton = null;
+
   for (const addName of addNames) {
     const addRegex = new RegExp('\\+?\\s*Add\\s+.*' + escapeRegExp(addName), 'i');
+
     const candidate = page
       .getByRole('button', { name: addRegex })
       .or(page.getByText(addRegex))
       .first();
-    if (await candidate.isVisible({ timeout: 1500 }).catch(() => false)) {
+
+    if (await candidate.isVisible({ timeout: 3000 }).catch(() => false)) {
       addButton = candidate;
       break;
     }
   }
+
   if (!addButton) {
     throw new Error('No "+ Add" button found for linked field "' + label + '"');
   }
 
-  await addButton.scrollIntoViewIfNeeded();
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(300);
+
+  await addButton.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
   await addButton.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
 
-  let search;
-  try {
-    search = await waitForPopoverSearch(page, ACTION_TIMEOUT_MS);
-  } catch (err) {
+  const searchInput = page
+    .locator('input[placeholder="Search"], input[placeholder="Find an option"], input[placeholder="Select an option"]')
+    .first();
+
+  if (!(await searchInput.isVisible({ timeout: 8000 }).catch(() => false))) {
     const visible = await listVisibleOptions(page);
-    const suffix = visible.length ? '. Currently visible: ' + visible.join(' | ') : '';
-    throw new Error('Linked-record popover did not open for "' + label + '"' + suffix);
+    throw new Error(
+      'Project picker opened but search input was not visible. Visible options: ' +
+      (visible.length ? visible.join(' | ') : 'none')
+    );
   }
 
-  const popoverHandle = await popoverContainerFor(search);
-  const picked = await searchAndPick(page, search, value, popoverHandle);
-  if (picked) return value;
+  await searchInput.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+  await page.keyboard.press('Control+A').catch(() => undefined);
+  await page.keyboard.press('Delete').catch(() => undefined);
+  await page.keyboard.type(String(value), { delay: 40 });
+
+  await page.waitForTimeout(1000);
+
+  const exactOption = page
+    .getByText(String(value), { exact: true })
+    .or(page.getByRole('option', { name: String(value), exact: true }))
+    .first();
+
+  if (await exactOption.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await exactOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+    await page.waitForTimeout(500);
+    await page.keyboard.press('Escape').catch(() => undefined);
+    return value;
+  }
+
+  const partialOption = page
+    .getByText(new RegExp(escapeRegExp(value), 'i'))
+    .or(page.getByRole('option', { name: new RegExp(escapeRegExp(value), 'i') }))
+    .first();
+
+  if (await partialOption.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await partialOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+    await page.waitForTimeout(500);
+    await page.keyboard.press('Escape').catch(() => undefined);
+    return value;
+  }
 
   const visible = await listVisibleOptions(page);
-  const suffix = visible.length ? '. Visible options: ' + visible.join(' | ') : '';
   throw new Error(
-    'No matching option for "' + label + '" value "' + value + '" after searching' + suffix
+    'No matching project option found for "' + value + '". Visible options: ' +
+    (visible.length ? visible.join(' | ') : 'none')
   );
 }
 
@@ -919,15 +972,26 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     // Project Site — linked-record popover.
     // Fallback: FIELD_DEFAULTS.project_site
     // -----------------------------------------------------------------------
-    selected.project_site = await stage('choose project site', () =>
-      withFB({
-        fieldName: 'project_site',
-        value: payload.project_site,
-        defaultValue: FIELD_DEFAULTS.project_site,
-        primaryFn: () => chooseLinkedProject(page, payload.project_site),
-        fallbackFn: () => chooseLinkedProject(page, FIELD_DEFAULTS.project_site),
-      })
-    );
+   selected.project_site = await stage('choose project site', async () => {
+  try {
+    return await chooseLinkedProject(page, payload.project_site);
+  } catch (error) {
+    console.warn('[project_site] failed, trying default:', error.message);
+
+    await page.keyboard.press('Escape').catch(() => undefined);
+    await page.waitForTimeout(500);
+
+    if (payload.project_site !== DEFAULTS.project_site) {
+      try {
+        return await chooseLinkedProject(page, DEFAULTS.project_site);
+      } catch (fallbackError) {
+       throw new Error('Project Site default also failed: ' + fallbackError.message);
+      }
+    }
+
+    throw new Error('Project Site could not be selected. Please confirm the project exists in the Airtable form options.');
+  }
+});
 
     // -----------------------------------------------------------------------
     // Reporter Name / Email — free text, no fallback needed (always filled).
@@ -1124,19 +1188,45 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       safeScreenshot(page, beforeSubmitPath)
     );
 
-    const shouldSubmit = !payload.test_mode && SUBMIT_MODE === 'live';
-    if (shouldSubmit) {
-      await stage('submit form', async () => {
-        const submitButton = page
-          .getByRole('button', { name: 'Submit Observation', exact: true })
-          .or(page.getByRole('button', { name: 'Submit', exact: true }))
-          .first();
-        await submitButton.click();
-        submitted = true;
-        await page.waitForLoadState('networkidle', { timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
-      });
+    const shouldSubmit = payload.test_mode === false && SUBMIT_MODE === 'live';
+
+if (shouldSubmit) {
+  await stage('submit form', async () => {
+    const submitButton = page
+      .getByRole('button', { name: /Submit Observation/i })
+      .or(page.getByRole('button', { name: /^Submit$/i }))
+      .or(page.locator('button:has-text("Submit")'))
+      .first();
+
+    await submitButton.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+    await submitButton.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+
+    await page.waitForTimeout(3000);
+
+    const successVisible = await page
+      .getByText(/thank you|submitted|success|your response has been submitted/i)
+      .first()
+      .isVisible({ timeout: 12000 })
+      .catch(() => false);
+
+    const validationVisible = await page
+      .getByText(/required|must be filled|please complete|invalid/i)
+      .first()
+      .isVisible({ timeout: 3000 })
+      .catch(() => false);
+
+    if (successVisible) {
+      submitted = true;
+      return;
     }
 
+    if (validationVisible) {
+      throw new Error('Airtable form validation failed after submit click.');
+    }
+
+    throw new Error('Submit clicked but no success confirmation was detected.');
+  });
+}
     const afterPath = join(tmpDir, submitted ? 'after-submit.png' : 'test-filled.png');
     const finalScreenshot = await stage('capture final screenshot', () =>
       safeScreenshot(page, afterPath)
@@ -1146,21 +1236,20 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await withTimeout(browser.close(), 5000, 'Timed out closing browser').catch(() => undefined);
 
     return {
-      success: true,
-      submitted,
-      test_mode: payload.test_mode,
-      selected_values: selected,
-      // Populated only when one or more fields fell back to a default.
-      // Empty array means every field matched exactly — no fallbacks triggered.
-      fallbacks_used: fallbacksUsed,
-      artifacts: {
-        directory: tmpDir,
-        before_submit_screenshot: beforeSubmitScreenshot,
-        final_screenshot: finalScreenshot,
-        before_submit_screenshot_url: artifactUrl(req, beforeSubmitScreenshot),
-        final_screenshot_url: artifactUrl(req, finalScreenshot),
-      },
-    };
+  success: true,
+  submitted,
+  test_mode: payload.test_mode,
+  submit_mode: SUBMIT_MODE,
+  selected_values: selected,
+  fallbacks_used: fallbacksUsed,
+  artifacts: {
+    directory: tmpDir,
+    before_submit_screenshot: beforeSubmitScreenshot,
+    final_screenshot: finalScreenshot,
+    before_submit_screenshot_url: artifactUrl(req, beforeSubmitScreenshot),
+    final_screenshot_url: artifactUrl(req, finalScreenshot),
+  },
+};
   } catch (error) {
     const errorPath = join(tmpDir, 'error.png');
     const errorScreenshot = await safeScreenshot(page, errorPath);
