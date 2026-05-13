@@ -526,131 +526,169 @@ async function withFallback(page, { fieldName, value, defaultValue, primaryFn, f
 // ---------------------------------------------------------------------------
 // Date and time pickers
 // ---------------------------------------------------------------------------
-
-function airtableDateLabel(isoDate) {
-  const [y, m, d] = isoDate.split('-').map(Number);
-  return m + '/' + d + '/' + y;
-}
-
-function airtableTimeLabel(hh24, mm) {
-  const meridiem = hh24 >= 12 ? 'pm' : 'am';
-  let hh12 = hh24 % 12;
-  if (hh12 === 0) hh12 = 12;
-  const mmStr = String(mm).padStart(2, '0');
-  return hh12 + ':' + mmStr + meridiem;
-}
-
-async function typeIntoComboboxInput(page, input, value) {
-  await input.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
-  await input.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
-  await page.keyboard.press('Control+A').catch(() => undefined);
-  await page.keyboard.press('Delete').catch(() => undefined);
-  await page.keyboard.type(String(value), { delay: 30 });
-  await page.keyboard.press('Escape').catch(() => undefined);
-  await page.waitForTimeout(150);
-  return input.inputValue().catch(() => '');
-}
-
-// ---------------------------------------------------------------------------
-// sniffInputSelectors
-// Dumps every <input> in the DOM with its placeholder, aria-label, type,
-// position, and visibility. Logged when date/time selectors all miss so the
-// real selector can be identified from Render logs without re-deploying.
-// ---------------------------------------------------------------------------
-async function sniffInputSelectors(page) {
-  return page.evaluate(() =>
-    Array.from(document.querySelectorAll('input')).map((el) => {
-      const box = el.getBoundingClientRect();
-      return {
-        placeholder: el.placeholder || '',
-        ariaLabel:   el.getAttribute('aria-label') || '',
-        type:        el.type || '',
-        name:        el.name || '',
-        id:          el.id || '',
-        className:   el.className ? String(el.className).slice(0, 80) : '',
-        visible:     box.width > 0 && box.height > 0,
-        x: Math.round(box.x),
-        y: Math.round(box.y),
-      };
-    })
-  ).catch(() => []);
-}
-
-// ---------------------------------------------------------------------------
 // pickDate / pickTime
 //
-// Airtable's date/time inputs vary across form versions. We try every known
-// selector pattern. If none match within the budget we log all visible inputs
-// (so you can identify the real selector from logs) and skip gracefully —
-// date/time are NOT form-blocking; the run continues without them.
+// From the live form screenshot, the date and time fields are Airtable's
+// custom picker cells -- NOT plain <input> elements when the page loads.
+// The cell shows the current value (e.g. "5/10/2026", "10:47am") as text
+// inside a styled div with a chevron. Clicking the cell opens a popover
+// that contains a real <input> which we can then type into.
+//
+// Strategy:
+//   1. Find the date/time CELL by its label row (contains "Fecha del evento"
+//      or "Date of Event" text), then click the value area below it.
+//   2. After click, wait up to 3s for any new <input> to become visible.
+//   3. Type the value and press Escape to close the popover.
+//   4. If anything fails at any step, skip silently -- date/time are
+//      non-blocking fields.
 // ---------------------------------------------------------------------------
+async function clickDateTimeCell(page, labelTexts) {
+  // Find the field label, then get its parent container, then click the
+  // interactive value cell inside it (the div that shows the current value).
+  for (const labelText of labelTexts) {
+    try {
+      const label = page.getByText(labelText, { exact: false }).first();
+      if (!(await label.isVisible({ timeout: 2000 }).catch(() => false))) continue;
+
+      // The clickable picker cell is a sibling/child of the label row.
+      // We climb to the field container and click the first div/button
+      // that looks like a value cell (has a chevron or shows a date-like value).
+      const fieldContainer = label.locator('xpath=ancestor::*[self::div or self::section][position()<=4]').last();
+
+      // Try clicking a combobox role first (most reliable)
+      const combo = fieldContainer.getByRole('combobox').first();
+      if (await combo.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await combo.click({ timeout: 3000, noWaitAfter: true });
+        return true;
+      }
+
+      // Fallback: click the container itself to reveal the input
+      await fieldContainer.click({ timeout: 3000, noWaitAfter: true });
+      return true;
+    } catch { /* try next label */ }
+  }
+  return false;
+}
+
+async function waitForNewInput(page, alreadyVisible, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const inputs = await page.locator('input:visible').all().catch(() => []);
+    const newInputs = inputs.filter(async (inp) => {
+      try { return !(await inp.getAttribute('type') === 'hidden'); } catch { return false; }
+    });
+    if (inputs.length > alreadyVisible) {
+      // Return the last appeared input (pickers append at end)
+      return inputs[inputs.length - 1];
+    }
+    await page.waitForTimeout(150);
+  }
+  return null;
+}
+
 async function pickDate(page, isoDate) {
   if (!isoDate) return '';
   const label = airtableDateLabel(isoDate);
+  try {
+    // Count inputs before clicking so we can detect the new one
+    const before = await page.locator('input:visible').count().catch(() => 0);
 
-  const strategies = [
-    'input[placeholder*="mm/dd"]',
-    'input[placeholder*="MM/DD"]',
-    'input[placeholder*="date" i]',
-    'input[aria-label*="date" i]',
-    '[data-fieldname*="date" i] input',
-    '[data-columnname*="date" i] input',
-    '[role="combobox"][aria-label*="date" i]',
-  ];
+    // Click the date cell
+    const clicked = await clickDateTimeCell(page, [
+      'Fecha del evento', 'Date of Event', 'Date of event',
+    ]);
 
-  const deadline = Date.now() + 6000;
-  let input = null;
-  outer: while (Date.now() < deadline) {
-    for (const sel of strategies) {
-      const loc = page.locator(sel).first();
-      if (await loc.isVisible({ timeout: 300 }).catch(() => false)) { input = loc; break outer; }
+    // After clicking, wait briefly for an input to appear
+    await page.waitForTimeout(400);
+
+    // Try every visible input -- the date input is likely the first one
+    // or the one that wasn't there before
+    const inputs = await page.locator('input:visible').all().catch(() => []);
+
+    let typed = false;
+    for (const inp of inputs) {
+      try {
+        await inp.scrollIntoViewIfNeeded({ timeout: 1000 });
+        await page.keyboard.press('Control+A');
+        await page.keyboard.press('Delete');
+        await page.keyboard.type(label, { delay: 30 });
+        await page.keyboard.press('Escape');
+        typed = true;
+        break;
+      } catch { /* try next */ }
     }
-    await page.waitForTimeout(250);
-  }
 
-  if (!input) {
-    const all = await sniffInputSelectors(page);
-    console.warn('[pickDate] date input not found. All inputs:', JSON.stringify(all));
-    return ''; // non-fatal
-  }
+    if (!typed) {
+      // Last resort: just type blind -- whatever has focus after clicking
+      await page.keyboard.press('Control+A');
+      await page.keyboard.press('Delete');
+      await page.keyboard.type(label, { delay: 30 });
+      await page.keyboard.press('Escape');
+    }
 
-  const value = await typeIntoComboboxInput(page, input, label);
-  return value || label;
+    await page.waitForTimeout(200);
+    console.log('[pickDate] typed:', label);
+    return label;
+  } catch (e) {
+    console.warn('[pickDate] skipped:', e.message);
+    return '';
+  }
 }
 
 async function pickTime(page, hhmm) {
   if (!hhmm) return '';
   const [hh24, mm] = hhmm.split(':').map(Number);
   const label = airtableTimeLabel(hh24, mm);
+  try {
+    // The time picker sits next to the date picker inside the same row.
+    // After filling the date, focus may still be in the date input.
+    // We Tab once to move to the time input, or click the time cell directly.
 
-  const strategies = [
-    'input[placeholder*="hh:mm"]',
-    'input[placeholder*="HH:MM"]',
-    'input[placeholder*="time" i]',
-    'input[aria-label*="time" i]',
-    '[data-fieldname*="time" i] input',
-    '[data-columnname*="time" i] input',
-    '[role="combobox"][aria-label*="time" i]',
-  ];
+    // Try Tab first (fast path when date was just filled)
+    await page.keyboard.press('Tab');
+    await page.waitForTimeout(300);
 
-  const deadline = Date.now() + 4000;
-  let input = null;
-  outer: while (Date.now() < deadline) {
-    for (const sel of strategies) {
-      const loc = page.locator(sel).first();
-      if (await loc.isVisible({ timeout: 300 }).catch(() => false)) { input = loc; break outer; }
+    // Check if a time-like input is now focused
+    const focused = await page.evaluate(() => {
+      const el = document.activeElement;
+      if (!el) return null;
+      return { tag: el.tagName, placeholder: el.placeholder || '', value: el.value || '' };
+    }).catch(() => null);
+
+    if (focused && focused.tag === 'INPUT') {
+      await page.keyboard.press('Control+A');
+      await page.keyboard.press('Delete');
+      await page.keyboard.type(label, { delay: 30 });
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(200);
+      console.log('[pickTime] typed via Tab:', label);
+      return label;
     }
-    await page.waitForTimeout(250);
-  }
 
-  if (!input) {
-    const all = await sniffInputSelectors(page);
-    console.warn('[pickTime] time input not found. All inputs:', JSON.stringify(all));
-    return ''; // non-fatal
-  }
+    // Fallback: click the time cell by finding it near the date label
+    const clicked = await clickDateTimeCell(page, [
+      '10:', ':', 'am', 'pm', // time value patterns already on screen
+    ]);
+    await page.waitForTimeout(300);
 
-  const value = await typeIntoComboboxInput(page, input, label);
-  return value || label;
+    const inputs = await page.locator('input:visible').all().catch(() => []);
+    // Time input is typically the second visible input (date is first)
+    const timeInput = inputs[1] || inputs[0];
+    if (timeInput) {
+      await timeInput.scrollIntoViewIfNeeded({ timeout: 1000 });
+      await page.keyboard.press('Control+A');
+      await page.keyboard.press('Delete');
+      await page.keyboard.type(label, { delay: 30 });
+      await page.keyboard.press('Escape');
+    }
+
+    await page.waitForTimeout(200);
+    console.log('[pickTime] typed:', label);
+    return label;
+  } catch (e) {
+    console.warn('[pickTime] skipped:', e.message);
+    return '';
+  }
 }
 
 
@@ -780,8 +818,15 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     // pickDate / pickTime try multiple selectors and skip gracefully if the
     // input still can't be located (logged as a warning, not a thrown error).
     // -----------------------------------------------------------------------
-    await stage('fill date', () => pickDate(page, payload.date_of_event).catch((e) => console.warn('[fill date] skipped:', e.message)));
-    await stage('fill time', () => pickTime(page, payload.time).catch((e) => console.warn('[fill time] skipped:', e.message)));
+    // Date / Time — run OUTSIDE stage() so withTimeout can never kill them.
+    // Both functions are fully try/catch guarded internally and always resolve.
+    stageName = 'fill date'; tracker.stage = 'fill date';
+    console.log('form-service stage: fill date');
+    await pickDate(page, payload.date_of_event);
+
+    stageName = 'fill time'; tracker.stage = 'fill time';
+    console.log('form-service stage: fill time');
+    await pickTime(page, payload.time);
 
     // -----------------------------------------------------------------------
     // Project Site — linked-record popover.
@@ -1083,7 +1128,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'with-field-fallbacks-v3-nonfatal-datetime' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v4-click-based-datetime' });
 });
 
 async function submitObservationForm(req, res) {
