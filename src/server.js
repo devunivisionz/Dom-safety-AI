@@ -421,14 +421,28 @@ async function chooseLinkedRecord(page, value, addNames, label) {
 
   console.log(`[${label}] search input visible, setting value directly`);
 
-  const searchHandle = await searchInput.elementHandle({ timeout: 8000 });
+  const searchSet = await page.evaluate((nextValue) => {
+  const inputs = Array.from(document.querySelectorAll(
+    'input[placeholder="Search"], input[placeholder="Find an option"], input[placeholder="Select an option"], input[aria-label="Search"]'
+  ));
 
-if (!searchHandle) {
-  throw new Error('Search input handle could not be created.');
-}
+  const visibleInput = inputs.find((element) => {
+    const style = window.getComputedStyle(element);
+    const box = element.getBoundingClientRect();
 
-await searchHandle.evaluate((element, nextValue) => {
-  element.focus();
+    return (
+      style.visibility !== 'hidden' &&
+      style.display !== 'none' &&
+      box.width > 0 &&
+      box.height > 0
+    );
+  });
+
+  if (!visibleInput) {
+    return false;
+  }
+
+  visibleInput.focus();
 
   const setter = Object.getOwnPropertyDescriptor(
     HTMLInputElement.prototype,
@@ -436,18 +450,26 @@ await searchHandle.evaluate((element, nextValue) => {
   )?.set;
 
   if (setter) {
-    setter.call(element, nextValue);
+    setter.call(visibleInput, nextValue);
   } else {
-    element.value = nextValue;
+    visibleInput.value = nextValue;
   }
 
-  element.dispatchEvent(new Event('input', { bubbles: true }));
-  element.dispatchEvent(new Event('change', { bubbles: true }));
-  element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-  element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+  visibleInput.dispatchEvent(new Event('input', { bubbles: true }));
+  visibleInput.dispatchEvent(new Event('change', { bubbles: true }));
+  visibleInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  visibleInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+
+  return true;
 }, String(value));
 
-await page.waitForTimeout(1500);
+if (!searchSet) {
+  const visible = await listVisibleOptions(page);
+  throw new Error(
+    'Search input was visible by locator but could not be found in DOM. Visible options: ' +
+    (visible.length ? visible.join(' | ') : 'none')
+  );
+}
 
 await page.waitForTimeout(1500);
 
@@ -1293,7 +1315,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v11-project-elementhandle-fix' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v12-project-dom-query-fix' });
 });
 
 function safeLogPayload(label, data) {
