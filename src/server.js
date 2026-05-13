@@ -542,6 +542,31 @@ async function withFallback(page, { fieldName, value, defaultValue, primaryFn, f
 //   4. If anything fails at any step, skip silently -- date/time are
 //      non-blocking fields.
 // ---------------------------------------------------------------------------
+
+function airtableDateLabel(isoDate) {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  return m + '/' + d + '/' + y;
+}
+
+function airtableTimeLabel(hh24, mm) {
+  const meridiem = hh24 >= 12 ? 'pm' : 'am';
+  let hh12 = hh24 % 12;
+  if (hh12 === 0) hh12 = 12;
+  const mmStr = String(mm).padStart(2, '0');
+  return hh12 + ':' + mmStr + meridiem;
+}
+
+async function typeIntoComboboxInput(page, input, value) {
+  await input.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+  await input.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+  await page.keyboard.press('Control+A').catch(() => undefined);
+  await page.keyboard.press('Delete').catch(() => undefined);
+  await page.keyboard.type(String(value), { delay: 30 });
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(150);
+  return input.inputValue().catch(() => '');
+}
+
 async function clickDateTimeCell(page, labelTexts) {
   // Find the field label, then get its parent container, then click the
   // interactive value cell inside it (the div that shows the current value).
