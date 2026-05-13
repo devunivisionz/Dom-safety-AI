@@ -551,10 +551,73 @@ async function typeIntoComboboxInput(page, input, value) {
   return input.inputValue().catch(() => '');
 }
 
+// ---------------------------------------------------------------------------
+// findDateInput / findTimeInput
+//
+// Airtable renders date and time as combobox-style <input> elements. Their
+// placeholder text has varied across form versions:
+//   Date: "mm/dd/yyyy"  |  "MM/DD/YYYY"  |  "Date"  |  aria-label match
+//   Time: "hh:mm pm"    |  "HH:MM"       |  "Time"  |  aria-label match
+//
+// We try every known selector in order and return the first one that becomes
+// visible within the given timeout. This avoids hard-coding a single selector
+// that breaks whenever Airtable updates their form renderer.
+// ---------------------------------------------------------------------------
+async function findDateInput(page, timeout = ACTION_TIMEOUT_MS) {
+  const selectors = [
+    'input[placeholder*="mm/dd"]',
+    'input[placeholder*="MM/DD"]',
+    'input[placeholder*="date" i]',
+    'input[aria-label*="date" i]',
+    'input[aria-label*="Date" i]',
+  ];
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible({ timeout: 400 }).catch(() => false)) return loc;
+    }
+    // Last resort: any visible input inside a cell that contains the word "date"
+    const cellInput = page
+      .locator('[data-columnname*="date" i] input, [data-fieldname*="date" i] input')
+      .first();
+    if (await cellInput.isVisible({ timeout: 400 }).catch(() => false)) return cellInput;
+    await page.waitForTimeout(300);
+  }
+  return null; // caller decides whether to skip or throw
+}
+
+async function findTimeInput(page, timeout = ACTION_TIMEOUT_MS) {
+  const selectors = [
+    'input[placeholder*="hh:mm"]',
+    'input[placeholder*="HH:MM"]',
+    'input[placeholder*="time" i]',
+    'input[aria-label*="time" i]',
+    'input[aria-label*="Time" i]',
+  ];
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible({ timeout: 400 }).catch(() => false)) return loc;
+    }
+    const cellInput = page
+      .locator('[data-columnname*="time" i] input, [data-fieldname*="time" i] input')
+      .first();
+    if (await cellInput.isVisible({ timeout: 400 }).catch(() => false)) return cellInput;
+    await page.waitForTimeout(300);
+  }
+  return null;
+}
+
 async function pickDate(page, isoDate) {
   if (!isoDate) return '';
   const label = airtableDateLabel(isoDate);
-  const input = page.locator('input[placeholder*="mm/dd"]').first();
+  const input = await findDateInput(page, ACTION_TIMEOUT_MS);
+  if (!input) {
+    console.warn('[pickDate] date input not found — skipping date fill. Form will use whatever default Airtable sets.');
+    return '';
+  }
   const value = await typeIntoComboboxInput(page, input, label);
   return value || label;
 }
@@ -563,7 +626,11 @@ async function pickTime(page, hhmm) {
   if (!hhmm) return '';
   const [hh24, mm] = hhmm.split(':').map(Number);
   const label = airtableTimeLabel(hh24, mm);
-  const input = page.locator('input[placeholder*="hh:mm"]').first();
+  const input = await findTimeInput(page, ACTION_TIMEOUT_MS);
+  if (!input) {
+    console.warn('[pickTime] time input not found — skipping time fill.');
+    return '';
+  }
   const value = await typeIntoComboboxInput(page, input, label);
   return value || label;
 }
@@ -619,6 +686,8 @@ function stageTimeout(name) {
   if (name === 'navigate Airtable form') return NAVIGATION_TIMEOUT_MS + 5000;
   if (name === 'wait Airtable network idle') return 25000;
   if (name === 'wait Airtable form ready') return FORM_READY_TIMEOUT_MS + 5000;
+  if (name === 'wait for form inputs') return FORM_READY_TIMEOUT_MS + 5000;
+  if (name === 'fill date' || name === 'fill time') return ACTION_TIMEOUT_MS * 2 + 5000;
   if (name === 'choose project site' || name === 'choose company' || name === 'choose contractor observed') return 45000;
   if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
   return ACTION_TIMEOUT_MS + 5000;
@@ -673,8 +742,23 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await stage('wait Airtable form ready', () => page.getByText(/Date\s+of\s+event/i).first().waitFor({ timeout: FORM_READY_TIMEOUT_MS }));
     await stage('dismiss cookie banner', () => dismissCookieBanner(page));
 
+    // Wait until at least one visible <input> exists — this confirms React has
+    // finished hydrating the form and all fields are interactive. Without this,
+    // pickDate arrives before the date input is in the DOM and times out.
+    await stage('wait for form inputs', async () => {
+      const deadline = Date.now() + FORM_READY_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        const visible = await page.locator('input:visible').count().catch(() => 0);
+        if (visible > 0) return;
+        await page.waitForTimeout(400);
+      }
+      console.warn('[wait for form inputs] no visible inputs after ' + FORM_READY_TIMEOUT_MS + 'ms — proceeding anyway');
+    });
+
     // -----------------------------------------------------------------------
-    // Date / Time — no enum fallback needed; values are free-typed.
+    // Date / Time — free-typed fields, non-fatal if input not found.
+    // pickDate / pickTime try multiple selectors and skip gracefully if the
+    // input still can't be located (logged as a warning, not a thrown error).
     // -----------------------------------------------------------------------
     await stage('fill date', () => pickDate(page, payload.date_of_event));
     await stage('fill time', () => pickTime(page, payload.time));
@@ -979,7 +1063,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'with-field-fallbacks' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'with-field-fallbacks-v2-resilient-date' });
 });
 
 async function submitObservationForm(req, res) {
