@@ -20,34 +20,53 @@ const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 30000)
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 155000);
 
+// ---------------------------------------------------------------------------
+// Field-level defaults used as fallbacks when a value cannot be matched in
+// the live form UI. These are applied INSIDE the browser automation so that
+// even if n8n sends an unrecognised value the form still submits cleanly.
+// ---------------------------------------------------------------------------
+const FIELD_DEFAULTS = {
+  project_site:             'Bauxite III (BWI100)',
+  reporter_name:            'Dominique Palmer',
+  reporter_email:           'Palmerdom84@gmail.com',
+  company_name:             'Turner Construction',
+  contractor_observed:      null,                    // null = skip the field entirely
+  type_of_observation:      'Unsafe Condition',      // safest non-positive branch
+  type_of_hazard:           null,                    // null = skip if unrecognised
+  severity:                 'Medium',
+  positive_safe_observation: null,                   // null = skip if unrecognised
+  stop_work_authority_used: 'Not Required',
+  followup_status:          'Follow Up Needed',
+};
+
 const DEFAULTS = {
-  project_site: 'Bauxite III (BWI100)',
-  reporter_name: 'Dominique Palmer',
-  reporter_email: 'Palmerdom84@gmail.com',
-  company_name: 'Turner Construction',
+  project_site:   FIELD_DEFAULTS.project_site,
+  reporter_name:  FIELD_DEFAULTS.reporter_name,
+  reporter_email: FIELD_DEFAULTS.reporter_email,
+  company_name:   FIELD_DEFAULTS.company_name,
 };
 
 const TYPE_OF_OBSERVATION_LABELS = {
-  'Unsafe Act': 'Unsafe Act (Acto Inseguro)',
-  'Unsafe Condition': 'Unsafe Condition (Condición insegura)',
-  'Positive/Safe Observation': 'Positive/Safe Observation (Observación positiva/segura)',
+  'Unsafe Act':               'Unsafe Act (Acto Inseguro)',
+  'Unsafe Condition':         'Unsafe Condition (Condición insegura)',
+  'Positive/Safe Observation':'Positive/Safe Observation (Observación positiva/segura)',
 };
 
 const STOP_WORK_LABELS = {
-  Yes: 'Yes (Si)',
+  Yes:            'Yes (Si)',
   'Not Required': 'Not Required (No Requerido)',
 };
 
 const FOLLOW_UP_LABELS = {
   'Corrected Onsite': 'Corrected Onsite (Corrigdo En El Sitio)',
   'Follow Up Needed': 'Follow Up Needed (Se Requiere Seguimiento)',
-  NA: 'NA',
+  NA:                 'NA',
 };
 
 const SEVERITY_LABELS = {
-  Low: 'Low',
+  Low:    'Low',
   Medium: 'Medium',
-  High: 'High',
+  High:   'High',
 };
 
 const REGEX_SPECIALS = /[\\^$.*+?()[\]{}|]/g;
@@ -57,11 +76,7 @@ function normalizeObservation(value) {
   if (text.includes('unsafe condition')) return 'Unsafe Condition';
   if (text.includes('unsafe act')) return 'Unsafe Act';
   if (text.includes('positive') || text.includes('safe observation')) return 'Positive/Safe Observation';
-  // Default: when nothing matches, fall back to Unsafe Condition. We
-  // explicitly avoid defaulting to Positive/Safe Observation because that
-  // branch of the form has additional required fields (Positive/Safe
-  // Observation dropdown) which we don't currently support.
-  return 'Unsafe Condition';
+  return FIELD_DEFAULTS.type_of_observation;
 }
 
 function normalizeStopWork(value) {
@@ -96,31 +111,31 @@ function normalizePayload(body) {
   const followUp = normalizeFollowUp(body.followup_status);
 
   return {
-    test_mode: body.test_mode !== false,
-    date_of_event: dateTime.date,
-    time: dateTime.time,
-    project_site: clean(body.project_site) || DEFAULTS.project_site,
-    reporter_name: clean(body.reporter_name) || DEFAULTS.reporter_name,
-    reporter_email: clean(body.reporter_email) || DEFAULTS.reporter_email,
-    company_name: clean(body.company_name) || DEFAULTS.company_name,
-    contractor_observed: clean(body.contractor_observed) || 'None',
-    type_of_observation: observation,
-    type_of_hazard: clean(body.type_of_hazard),
+    test_mode:                body.test_mode !== false,
+    date_of_event:            dateTime.date,
+    time:                     dateTime.time,
+    project_site:             clean(body.project_site) || DEFAULTS.project_site,
+    reporter_name:            clean(body.reporter_name) || DEFAULTS.reporter_name,
+    reporter_email:           clean(body.reporter_email) || DEFAULTS.reporter_email,
+    company_name:             clean(body.company_name) || DEFAULTS.company_name,
+    contractor_observed:      clean(body.contractor_observed) || 'None',
+    type_of_observation:      observation,
+    type_of_hazard:           clean(body.type_of_hazard),
     severity,
-    positive_safe_observation: clean(body.positive_safe_observation),
+    positive_safe_observation:clean(body.positive_safe_observation),
     stop_work_authority_used: stopWork,
-    description_of_event: clean(body.description_of_event),
-    corrective_action: clean(body.corrective_action),
-    followup_status: followUp,
-    photo_base64: clean(body.photo_base64),
-    photo_url: clean(body.photo_url),
-    photo_filename: clean(body.photo_filename) || 'safety-observation.jpg',
-    photo_content_type: clean(body.photo_content_type) || 'image/jpeg',
+    description_of_event:     clean(body.description_of_event),
+    corrective_action:        clean(body.corrective_action),
+    followup_status:          followUp,
+    photo_base64:             clean(body.photo_base64),
+    photo_url:                clean(body.photo_url),
+    photo_filename:           clean(body.photo_filename) || 'safety-observation.jpg',
+    photo_content_type:       clean(body.photo_content_type) || 'image/jpeg',
     selected_values: {
-      type_of_observation: TYPE_OF_OBSERVATION_LABELS[observation],
-      severity: SEVERITY_LABELS[severity],
+      type_of_observation:      TYPE_OF_OBSERVATION_LABELS[observation],
+      severity:                 SEVERITY_LABELS[severity],
       stop_work_authority_used: STOP_WORK_LABELS[stopWork],
-      followup_status: FOLLOW_UP_LABELS[followUp],
+      followup_status:          FOLLOW_UP_LABELS[followUp],
     },
   };
 }
@@ -145,11 +160,6 @@ function normalizeTime(value) {
   const hours = Math.max(0, Math.min(23, Number(match[1])));
   const minutes = Math.max(0, Math.min(59, Number(match[2])));
   return String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0');
-}
-
-function dateForAirtable(date) {
-  const [year, month, day] = date.split('-');
-  return month + '/' + day + '/' + year;
 }
 
 function escapeRegExp(value) {
@@ -226,42 +236,10 @@ async function visibleOptionNames(page) {
   return [...new Set(options)].slice(0, 12);
 }
 
-// -----------------------------------------------------------------------------
-// Airtable-specific UI patterns (verified against the live form screenshots).
-//
-// Three popover styles exist on this form:
-//
-//   1. Linked-record popover (Project Site):
-//      Trigger: a "+ Add project" button.
-//      Popover: floating panel below the button, NOT role="dialog".
-//      Search input placeholder: "Search".
-//      Options: plain text rows (not pills).
-//
-//   2. Inline searchable dropdown (Name of Company, Name of Contractor
-//      Observed, Type of Hazard):
-//      Trigger: chevron button on a combobox row.
-//      Popover: appears directly under the combobox.
-//      Search input placeholder: "Find an option" or "Select an option".
-//      Options: pill-shaped chips inside the popover.
-//
-//   3. Radio group (Type of Observation, Stop Work Authority Used,
-//      Was the issue corrected onsite or is follow up needed):
-//      Pill labels with circular radio buttons. Handled by chooseRadio().
-//
-// None of these use role="dialog" -- earlier code that waited for
-// role="dialog" timed out because no dialog ever appeared. The picker
-// popover is just a floating panel. We detect it by waiting for the
-// search input itself to appear, then scope all queries to that input's
-// nearest containing popover (its scrollable list parent).
-// -----------------------------------------------------------------------------
-
 const POPOVER_SEARCH_PLACEHOLDERS = ['Search', 'Find an option', 'Select an option'];
 
-// After clicking a trigger, find the search input that just became visible.
-// Tries the placeholder texts shown in the live form, in order.
 async function waitForPopoverSearch(page, timeout = ACTION_TIMEOUT_MS) {
   const start = Date.now();
-  // Build one combined locator covering every known placeholder + role=combobox.
   let combined;
   for (const placeholder of POPOVER_SEARCH_PLACEHOLDERS) {
     const candidate = page.locator(
@@ -269,7 +247,6 @@ async function waitForPopoverSearch(page, timeout = ACTION_TIMEOUT_MS) {
     );
     combined = combined ? combined.or(candidate) : candidate;
   }
-  // Also accept any newly-appeared role=combobox or aria-label search input.
   combined = combined
     .or(page.locator('[role="dialog"] input[role="combobox"]'))
     .or(page.locator('[role="listbox"] input'));
@@ -284,11 +261,7 @@ async function waitForPopoverSearch(page, timeout = ACTION_TIMEOUT_MS) {
   throw new Error('Popover search input did not appear within ' + timeout + 'ms');
 }
 
-// Given the visible search input, return its containing popover element.
-// Used to scope option-clicks so we don't grab pills from the page background.
 async function popoverContainerFor(searchInput) {
-  // The popover is the nearest ancestor that scrolls (overflow auto/scroll)
-  // or has role="dialog"/"listbox", whichever we find first.
   const handle = await searchInput.elementHandle();
   if (!handle) return null;
   const containerHandle = await handle.evaluateHandle((el) => {
@@ -298,7 +271,6 @@ async function popoverContainerFor(searchInput) {
       if (role === 'dialog' || role === 'listbox') return node;
       const style = window.getComputedStyle(node);
       if (style.overflowY === 'auto' || style.overflowY === 'scroll') return node;
-      // Airtable popovers also tend to have position: absolute|fixed.
       if (style.position === 'absolute' || style.position === 'fixed') return node;
       node = node.parentElement;
     }
@@ -309,30 +281,15 @@ async function popoverContainerFor(searchInput) {
     : null;
 }
 
-// Type into the search and click a matching option.
 async function searchAndPick(page, searchInput, value, popoverHandle) {
-  // Focus the input. Use focus() rather than click() if possible -- click
-  // can scroll/reflow the popover and disturb its position.
   try {
     await searchInput.focus({ timeout: ACTION_TIMEOUT_MS });
   } catch {
     await searchInput.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true }).catch(() => undefined);
   }
 
-  // Clear by selecting all + delete. Avoid .fill() on combobox-style inputs
-  // (they can reject programmatic value-sets via property setter).
   await page.keyboard.press('Control+A').catch(() => undefined);
   await page.keyboard.press('Delete').catch(() => undefined);
-
-  // CRITICAL: use page.keyboard.type() not searchInput.type().
-  //
-  // searchInput.type() re-checks actionability (visible/stable/enabled) on
-  // every keystroke. When Airtable's React re-renders the popover during
-  // typing -- which it does as filter results update -- the input briefly
-  // becomes unstable, and each keystroke retries until timeout.
-  //
-  // page.keyboard.type() just sends keystrokes to whatever has focus. No
-  // per-character actionability check, no retries, no timeout.
   await page.keyboard.type(String(value), { delay: 30 });
   await page.waitForTimeout(500);
 
@@ -358,13 +315,10 @@ async function searchAndPick(page, searchInput, value, popoverHandle) {
   return false;
 }
 
-// Diagnostic: list visible option-like elements anywhere on the page.
-// This is what shows up in the error message when no option matches.
 async function listVisibleOptions(page) {
   const opts = await page.evaluate(() => {
     const out = [];
     const seen = new Set();
-    // Try options, then anything that looks like a pill/row in a popover.
     const nodes = Array.from(document.querySelectorAll(
       '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button'
     ));
@@ -384,9 +338,15 @@ async function listVisibleOptions(page) {
   return opts;
 }
 
-// -----------------------------------------------------------------------------
-// Pattern 1: linked-record with "+ Add project" button (Project Site).
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Close any open popover by pressing Escape. Used after a failed pick attempt
+// so subsequent field interactions start from a clean state.
+// ---------------------------------------------------------------------------
+async function dismissOpenPopover(page) {
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(200);
+}
+
 async function chooseLinkedRecord(page, value, addNames, label) {
   if (!value) return '';
 
@@ -409,8 +369,6 @@ async function chooseLinkedRecord(page, value, addNames, label) {
   await addButton.scrollIntoViewIfNeeded();
   await addButton.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
 
-  // Wait for the popover's search input to appear. The popover is NOT a
-  // role="dialog" -- we previously waited for that and timed out.
   let search;
   try {
     search = await waitForPopoverSearch(page, ACTION_TIMEOUT_MS);
@@ -435,29 +393,19 @@ async function chooseLinkedProject(page, value) {
   return chooseLinkedRecord(page, value, ['project'], 'Project Site');
 }
 
-// -----------------------------------------------------------------------------
-// Pattern 2: inline searchable dropdown (Company, Contractor, Hazard).
-// Click the combobox row, type into "Find an option" / "Select an option",
-// click the matching pill.
-// -----------------------------------------------------------------------------
 async function chooseCombo(page, label, value) {
   if (!value) return '';
   const combo = comboByLabel(page, label);
   await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
   await combo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
 
-  // Wait for the popover's search input. If no search input exists (rare,
-  // but possible for very small option lists), we still try clicking
-  // visible options below.
   let search = null;
   try {
     search = await waitForPopoverSearch(page, 4000);
   } catch {
-    // No search input -- maybe the popover shows options directly.
+    // No search input
   }
 
-  // First, try clicking the option directly. Airtable shows visible options
-  // even before the user types into the search box.
   if (await clickVisibleOption(page, value, 1500)) return value;
 
   if (!search) {
@@ -521,31 +469,65 @@ async function checkCheckboxIfPresent(page, label) {
   return false;
 }
 
-// -----------------------------------------------------------------------------
-// Date and time pickers (Date of Event field).
+// ---------------------------------------------------------------------------
+// withFallback — wraps any field-fill attempt with a graceful fallback.
 //
-// IMPORTANT: Although these LOOK like fancy comboboxes (calendar popover for
-// date, scrollable 30-min list for time), the underlying inputs ALSO accept
-// free-form typed values. Airtable's API stores them as a single ISO datetime
-// (e.g. "2026-05-14T10:17:00.000Z"), and arbitrary minute values like 10:17
-// are valid -- proof that picker-clicking isn't the only path.
+// Parameters:
+//   fieldName     — human-readable key (matches FIELD_DEFAULTS keys)
+//   value         — the value n8n sent (may be invalid/unrecognised)
+//   defaultValue  — what to try if `value` fails (from FIELD_DEFAULTS)
+//   primaryFn     — async () => result using `value`
+//   fallbackFn    — async () => result using `defaultValue` (can differ from primaryFn)
+//   fallbacksUsed — array that receives { field, tried, usedDefault } entries
+//   warn          — optional logger, defaults to console.warn
 //
-// The earlier .fill() approach failed with "waiting for element to be ...
-// editable". That's because Airtable's date/time inputs become editable only
-// after a focus/click. So the fix is: click first, then type the value, then
-// press Escape to dismiss any popover that opened, then verify the value
-// stuck. We do NOT navigate the calendar or scroll the time list.
-//
-// Format expected by the inputs:
-//   - Date: M/D/YYYY (the input shows "5/7/2026" in the live form, no
-//     leading zeros). MM/DD/YYYY also works.
-//   - Time: h:mmam / h:mmpm (lowercase, no space). 24-hour HH:MM may also
-//     parse but matching the picker's display format is safest.
-// -----------------------------------------------------------------------------
+// Behaviour:
+//   1. Try primaryFn(value).  If it succeeds, return its result.
+//   2. If it throws and defaultValue is non-null/non-empty AND different from value,
+//      log a warning, push to fallbacksUsed, dismiss any open popover, try fallbackFn.
+//   3. If defaultValue is null (field is optional), swallow the error and return null.
+//   4. If fallbackFn also throws, propagate — the stage error path will capture it.
+// ---------------------------------------------------------------------------
+async function withFallback(page, { fieldName, value, defaultValue, primaryFn, fallbackFn, fallbacksUsed, warn = console.warn }) {
+  try {
+    return await primaryFn();
+  } catch (primaryError) {
+    // If there is no meaningful default, treat the field as optional and skip it.
+    if (defaultValue === null || defaultValue === undefined || defaultValue === '') {
+      warn(
+        '[fallback] field "' + fieldName + '" value "' + value + '" failed and has no default — skipping. ' +
+        'Error: ' + primaryError.message
+      );
+      fallbacksUsed.push({ field: fieldName, tried: value, usedDefault: null, skipped: true });
+      await dismissOpenPopover(page);
+      return null;
+    }
+
+    // If the value that was tried IS the default, don't retry (it would loop).
+    if (String(value).trim().toLowerCase() === String(defaultValue).trim().toLowerCase()) {
+      throw primaryError;
+    }
+
+    warn(
+      '[fallback] field "' + fieldName + '" value "' + value + '" not found — ' +
+      'retrying with default "' + defaultValue + '". Error: ' + primaryError.message
+    );
+    fallbacksUsed.push({ field: fieldName, tried: value, usedDefault: defaultValue });
+    await dismissOpenPopover(page);
+
+    // Use the explicit fallbackFn if provided, otherwise just re-run primaryFn
+    // substituting the default value. Callers that use different UI patterns for
+    // the fallback (e.g. chooseRadio vs chooseCombo) supply their own fallbackFn.
+    const fn = fallbackFn || primaryFn;
+    return await fn();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Date and time pickers
+// ---------------------------------------------------------------------------
 
 function airtableDateLabel(isoDate) {
-  // isoDate is "YYYY-MM-DD". We output "M/D/YYYY" without leading zeros to
-  // match the live form's display ("5/7/2026").
   const [y, m, d] = isoDate.split('-').map(Number);
   return m + '/' + d + '/' + y;
 }
@@ -558,40 +540,20 @@ function airtableTimeLabel(hh24, mm) {
   return hh12 + ':' + mmStr + meridiem;
 }
 
-// Type a value into a focused combobox-style input, working around the
-// "not editable until focused" behavior. Returns the value that ended up
-// in the input.
 async function typeIntoComboboxInput(page, input, value) {
   await input.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
-  // Click to focus; this makes the input editable.
   await input.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
-
-  // Select all + delete to clear any existing value (handles cases where
-  // .fill('') is rejected because the input refuses programmatic clears).
   await page.keyboard.press('Control+A').catch(() => undefined);
   await page.keyboard.press('Delete').catch(() => undefined);
-
-  // Use page.keyboard.type() instead of input.type() -- input.type()
-  // re-checks actionability per keystroke, which can time out when Airtable's
-  // React re-renders the popover/dropdown during typing. page.keyboard.type()
-  // sends keystrokes to whatever has focus without per-character retry.
   await page.keyboard.type(String(value), { delay: 30 });
-
-  // Press Escape to close the calendar/time-list popover if it opened.
-  // Without this, the popover can swallow subsequent clicks on other fields.
   await page.keyboard.press('Escape').catch(() => undefined);
   await page.waitForTimeout(150);
-
   return input.inputValue().catch(() => '');
 }
 
 async function pickDate(page, isoDate) {
   if (!isoDate) return '';
   const label = airtableDateLabel(isoDate);
-
-  // Find the date input by placeholder. The form has two side-by-side combos
-  // in the Date of Event cell ("mm/dd/yyyy" and "hh:mm pm"); placeholder
-  // matching unambiguously picks the date one.
   const input = page.locator('input[placeholder*="mm/dd"]').first();
   const value = await typeIntoComboboxInput(page, input, label);
   return value || label;
@@ -601,7 +563,6 @@ async function pickTime(page, hhmm) {
   if (!hhmm) return '';
   const [hh24, mm] = hhmm.split(':').map(Number);
   const label = airtableTimeLabel(hh24, mm);
-
   const input = page.locator('input[placeholder*="hh:mm"]').first();
   const value = await typeIntoComboboxInput(page, input, label);
   return value || label;
@@ -636,18 +597,6 @@ function withTimeout(promise, timeoutMs, message) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
-// -----------------------------------------------------------------------------
-// Conditional field detection.
-//
-// The form branches on "Type of Observation":
-//   - "Unsafe Act" / "Unsafe Condition" --> shows Type of Hazard, Severity
-//   - "Positive/Safe Observation"       --> shows a "Positive/Safe Observation"
-//                                          dropdown, hides Severity
-// Rather than hardcode the branching rules (which can change), we just
-// check whether each field's label is currently rendered before trying to
-// fill it. Fields that aren't visible are skipped silently.
-// -----------------------------------------------------------------------------
-
 async function isFieldVisible(page, label, timeout = 1500) {
   const locator = page
     .getByText(label, { exact: true })
@@ -656,8 +605,6 @@ async function isFieldVisible(page, label, timeout = 1500) {
   return locator.isVisible({ timeout }).catch(() => false);
 }
 
-// Run a stage only if the given field label is currently visible. Returns
-// the value the inner function returned, or null if the field was skipped.
 async function stageIfVisible(stage, name, label, page, fn) {
   const visible = await isFieldVisible(page, label);
   if (!visible) {
@@ -677,13 +624,20 @@ function stageTimeout(name) {
   return ACTION_TIMEOUT_MS + 5000;
 }
 
+// ---------------------------------------------------------------------------
+// fillForm — main automation entry point
+// ---------------------------------------------------------------------------
 async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
   const tmpDir = await mkdtemp(join(tmpdir(), 'safety-observation-'));
   const selected = { ...payload.selected_values };
+
+  // Collects every field that fell back to a default during this run.
+  // Returned in the response so the caller can audit which fields were affected.
+  const fallbacksUsed = [];
+
   let browser;
   let context;
   let page;
-  let photoPath = '';
   let submitted = false;
   let stageName = 'initializing';
 
@@ -693,6 +647,9 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     console.log('form-service stage: ' + name);
     return withTimeout(Promise.resolve().then(fn), stageTimeout(name), 'Timed out during stage "' + name + '"');
   };
+
+  // Convenience: build a withFallback call pre-bound to the shared fallbacksUsed array.
+  const withFB = (opts) => withFallback(page, { ...opts, fallbacksUsed });
 
   try {
     browser = await stage('launch browser', async () => playwrightChromium.launch({
@@ -716,89 +673,164 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await stage('wait Airtable form ready', () => page.getByText(/Date\s+of\s+event/i).first().waitFor({ timeout: FORM_READY_TIMEOUT_MS }));
     await stage('dismiss cookie banner', () => dismissCookieBanner(page));
 
+    // -----------------------------------------------------------------------
+    // Date / Time — no enum fallback needed; values are free-typed.
+    // -----------------------------------------------------------------------
     await stage('fill date', () => pickDate(page, payload.date_of_event));
     await stage('fill time', () => pickTime(page, payload.time));
-    selected.project_site = await stage('choose project site', () => chooseLinkedProject(page, payload.project_site));
+
+    // -----------------------------------------------------------------------
+    // Project Site — linked-record popover.
+    // Fallback: FIELD_DEFAULTS.project_site
+    // -----------------------------------------------------------------------
+    selected.project_site = await stage('choose project site', () =>
+      withFB({
+        fieldName: 'project_site',
+        value: payload.project_site,
+        defaultValue: FIELD_DEFAULTS.project_site,
+        primaryFn: () => chooseLinkedProject(page, payload.project_site),
+        fallbackFn: () => chooseLinkedProject(page, FIELD_DEFAULTS.project_site),
+      })
+    );
+
+    // -----------------------------------------------------------------------
+    // Reporter Name / Email — free text, no fallback needed (always filled).
+    // -----------------------------------------------------------------------
     await stage('fill reporter name', () => fillText(page, 'Your Name (First and Last)', payload.reporter_name));
     await stage('fill reporter email', () => fillText(page, 'Your Email Address', payload.reporter_email));
-    // "Name of Company" is a single-select dropdown, NOT a linked record.
-    // The captured Airtable payload shows it submits a `sel...` option ID
-    // (e.g. "selWXBQs2c3QUZHU8"), not a `rec...` linked-record ID. There's
-    // no "+ Add" button -- it's a regular combobox like Type of Hazard.
-    selected.company_name = await stage(
-      'choose company',
-      () => chooseCombo(page, 'Name of Company', payload.company_name)
-    );
-    selected.contractor_observed = isUnsetOption(payload.contractor_observed)
-      ? ''
-      : await stage(
-          'choose contractor observed',
-          // Per the live-form screenshot, this is an inline searchable dropdown
-          // (chevron + "Find an option" + scrollable pills), NOT a linked-record
-          // popover with an "+ Add" button -- even though the underlying field
-          // submits a foreignRowId. Use chooseCombo, not chooseLinkedRecord.
-          () => chooseCombo(page, 'Name of Contractor Observed', payload.contractor_observed)
-        );
-        selected.type_of_observation = await stage('choose type of observation', () => chooseRadio(page, 'Type of Observation', TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]));
 
-    // After choosing observation type, the form re-renders to show/hide
-    // branch-specific fields. Give it a beat.
+    // -----------------------------------------------------------------------
+    // Company Name — searchable single-select dropdown.
+    // Fallback: FIELD_DEFAULTS.company_name ("Turner Construction")
+    // -----------------------------------------------------------------------
+    selected.company_name = await stage('choose company', () =>
+      withFB({
+        fieldName: 'company_name',
+        value: payload.company_name,
+        defaultValue: FIELD_DEFAULTS.company_name,
+        primaryFn: () => chooseCombo(page, 'Name of Company', payload.company_name),
+        fallbackFn: () => chooseCombo(page, 'Name of Company', FIELD_DEFAULTS.company_name),
+      })
+    );
+
+    // -----------------------------------------------------------------------
+    // Contractor Observed — optional searchable dropdown.
+    // Fallback: null (skip the field — it's not required).
+    // -----------------------------------------------------------------------
+    if (!isUnsetOption(payload.contractor_observed)) {
+      selected.contractor_observed = await stage('choose contractor observed', () =>
+        withFB({
+          fieldName: 'contractor_observed',
+          value: payload.contractor_observed,
+          defaultValue: FIELD_DEFAULTS.contractor_observed, // null → skip on failure
+          primaryFn: () => chooseCombo(page, 'Name of Contractor Observed', payload.contractor_observed),
+          // fallbackFn omitted intentionally — defaultValue null means skip.
+        })
+      );
+    } else {
+      selected.contractor_observed = '';
+    }
+
+    // -----------------------------------------------------------------------
+    // Type of Observation — radio group.
+    // Fallback: FIELD_DEFAULTS.type_of_observation ("Unsafe Condition")
+    // The label sent to the form is the long bilingual label from TYPE_OF_OBSERVATION_LABELS.
+    // -----------------------------------------------------------------------
+    const observationLabel = TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation];
+    const fallbackObservationLabel = TYPE_OF_OBSERVATION_LABELS[FIELD_DEFAULTS.type_of_observation];
+
+    selected.type_of_observation = await stage('choose type of observation', () =>
+      withFB({
+        fieldName: 'type_of_observation',
+        value: observationLabel,
+        defaultValue: fallbackObservationLabel,
+        primaryFn: () => chooseRadio(page, 'Type of Observation', observationLabel),
+        fallbackFn: () => chooseRadio(page, 'Type of Observation', fallbackObservationLabel),
+      })
+    );
+
+    // After choosing observation type the form re-renders.
     await page.waitForTimeout(300);
 
-    // Positive/Safe Observation dropdown (only appears for Positive/Safe Observation type)
+    // -----------------------------------------------------------------------
+    // Positive/Safe Observation dropdown (only visible on that branch).
+    // Fallback: null (skip — it's conditional and optional within that branch).
+    // -----------------------------------------------------------------------
     selected.positive_safe_observation = await stageIfVisible(
       stage,
       'choose positive/safe observation',
       'Positive/Safe Observation',
       page,
-      () => chooseCombo(page, 'Positive/Safe Observation', payload.positive_safe_observation)
+      () => withFB({
+        fieldName: 'positive_safe_observation',
+        value: payload.positive_safe_observation,
+        defaultValue: FIELD_DEFAULTS.positive_safe_observation, // null → skip on failure
+        primaryFn: () => chooseCombo(page, 'Positive/Safe Observation', payload.positive_safe_observation),
+      })
     );
 
-    // Type of Hazard and Severity are only visible on Unsafe Act / Unsafe Condition branches
-    // selected.type_of_hazard = await stageIfVisible(
-    //   stage,
-    //   'choose type of hazard',
-    //   'Type of Hazard',
-    //   page,
-    //   () => chooseCombo(page, 'Type of Hazard', payload.type_of_hazard)
-    // );
-
-    // selected.severity = await stageIfVisible(
-    //   stage,
-    //   'choose severity',
-    //   'Severity',
-    //   page,
-    //   () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity])
-    // );
-
-    // After choosing observation type, the form re-renders to show/hide
-    // branch-specific fields. Give it a beat.
-    // await page.waitForTimeout(300);
-
-    // Type of Hazard and Severity are both visible on the Unsafe Act /
-    // Unsafe Condition branches (the only branches we support). We still
-    // wrap in stageIfVisible as a safety net in case the form changes.
+    // -----------------------------------------------------------------------
+    // Type of Hazard — searchable dropdown (Unsafe Act / Unsafe Condition branch).
+    // Fallback: null (skip — hazard type is not always required).
+    // -----------------------------------------------------------------------
     selected.type_of_hazard = await stageIfVisible(
       stage,
       'choose type of hazard',
       'Type of Hazard',
       page,
-      () => chooseCombo(page, 'Type of Hazard', payload.type_of_hazard)
+      () => withFB({
+        fieldName: 'type_of_hazard',
+        value: payload.type_of_hazard,
+        defaultValue: FIELD_DEFAULTS.type_of_hazard, // null → skip on failure
+        primaryFn: () => chooseCombo(page, 'Type of Hazard', payload.type_of_hazard),
+      })
     );
 
+    // -----------------------------------------------------------------------
+    // Severity — combo or radio (Unsafe Act / Unsafe Condition branch).
+    // Fallback: FIELD_DEFAULTS.severity ("Medium")
+    // -----------------------------------------------------------------------
     selected.severity = await stageIfVisible(
       stage,
       'choose severity',
       'Severity',
       page,
-      () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity])
+      () => withFB({
+        fieldName: 'severity',
+        value: SEVERITY_LABELS[payload.severity],
+        defaultValue: SEVERITY_LABELS[FIELD_DEFAULTS.severity],
+        primaryFn: () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity]),
+        fallbackFn: () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[FIELD_DEFAULTS.severity]),
+      })
     );
 
-    selected.confirmation_checked = await stage('check confirmation', () => checkCheckboxIfPresent(page, 'Please check this box'));
-    selected.stop_work_authority_used = await stage('choose stop work authority', () => chooseRadio(page, 'Stop Work Authority Used?', STOP_WORK_LABELS[payload.stop_work_authority_used]));
+    // -----------------------------------------------------------------------
+    // Confirmation checkbox — optional, no fallback needed.
+    // -----------------------------------------------------------------------
+    selected.confirmation_checked = await stage('check confirmation', () =>
+      checkCheckboxIfPresent(page, 'Please check this box')
+    );
 
-    // Description of Event: the field label may be "Description of Event" or
-    // "Description of Event (original)" depending on form variant. Try both.
+    // -----------------------------------------------------------------------
+    // Stop Work Authority Used — radio group.
+    // Fallback: FIELD_DEFAULTS.stop_work_authority_used ("Not Required")
+    // -----------------------------------------------------------------------
+    const stopWorkLabel = STOP_WORK_LABELS[payload.stop_work_authority_used];
+    const fallbackStopWorkLabel = STOP_WORK_LABELS[FIELD_DEFAULTS.stop_work_authority_used];
+
+    selected.stop_work_authority_used = await stage('choose stop work authority', () =>
+      withFB({
+        fieldName: 'stop_work_authority_used',
+        value: stopWorkLabel,
+        defaultValue: fallbackStopWorkLabel,
+        primaryFn: () => chooseRadio(page, 'Stop Work Authority Used?', stopWorkLabel),
+        fallbackFn: () => chooseRadio(page, 'Stop Work Authority Used?', fallbackStopWorkLabel),
+      })
+    );
+
+    // -----------------------------------------------------------------------
+    // Description of Event — free text, no enum fallback needed.
+    // -----------------------------------------------------------------------
     await stage('fill description', async () => {
       const text = payload.description_of_event || payload.positive_safe_observation;
       if (!text) return;
@@ -807,12 +839,36 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       await fillText(page, labelToUse, text);
     });
 
-    await stage('fill corrective action', () => fillText(page, 'Corrective Action', payload.corrective_action));
-    selected.followup_status = await stage('choose follow-up status', () => chooseRadio(page, 'Was the issue corrected onsite or is follow up needed?', FOLLOW_UP_LABELS[payload.followup_status]));
+    // -----------------------------------------------------------------------
+    // Corrective Action — free text, no enum fallback needed.
+    // -----------------------------------------------------------------------
+    await stage('fill corrective action', () =>
+      fillText(page, 'Corrective Action', payload.corrective_action)
+    );
 
+    // -----------------------------------------------------------------------
+    // Follow-up Status — radio group.
+    // Fallback: FIELD_DEFAULTS.followup_status ("Follow Up Needed")
+    // -----------------------------------------------------------------------
+    const followUpLabel = FOLLOW_UP_LABELS[payload.followup_status];
+    const fallbackFollowUpLabel = FOLLOW_UP_LABELS[FIELD_DEFAULTS.followup_status];
+
+    selected.followup_status = await stage('choose follow-up status', () =>
+      withFB({
+        fieldName: 'followup_status',
+        value: followUpLabel,
+        defaultValue: fallbackFollowUpLabel,
+        primaryFn: () => chooseRadio(page, 'Was the issue corrected onsite or is follow up needed?', followUpLabel),
+        fallbackFn: () => chooseRadio(page, 'Was the issue corrected onsite or is follow up needed?', fallbackFollowUpLabel),
+      })
+    );
+
+    // -----------------------------------------------------------------------
+    // Photo attachment — no fallback (optional binary field).
+    // -----------------------------------------------------------------------
     if (payload.photo_base64 || payload.photo_url) {
       await stage('attach photo', async () => {
-        photoPath = join(tmpDir, payload.photo_filename);
+        const photoPath = join(tmpDir, payload.photo_filename);
         if (payload.photo_base64) {
           await writeFile(photoPath, Buffer.from(payload.photo_base64, 'base64'));
         } else {
@@ -828,7 +884,9 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     }
 
     const beforeSubmitPath = join(tmpDir, 'before-submit.png');
-    const beforeSubmitScreenshot = await stage('capture before-submit screenshot', () => safeScreenshot(page, beforeSubmitPath));
+    const beforeSubmitScreenshot = await stage('capture before-submit screenshot', () =>
+      safeScreenshot(page, beforeSubmitPath)
+    );
 
     const shouldSubmit = !payload.test_mode && SUBMIT_MODE === 'live';
     if (shouldSubmit) {
@@ -844,7 +902,9 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     }
 
     const afterPath = join(tmpDir, submitted ? 'after-submit.png' : 'test-filled.png');
-    const finalScreenshot = await stage('capture final screenshot', () => safeScreenshot(page, afterPath));
+    const finalScreenshot = await stage('capture final screenshot', () =>
+      safeScreenshot(page, afterPath)
+    );
 
     await withTimeout(context.close(), 5000, 'Timed out closing browser context').catch(() => undefined);
     await withTimeout(browser.close(), 5000, 'Timed out closing browser').catch(() => undefined);
@@ -854,6 +914,9 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       submitted,
       test_mode: payload.test_mode,
       selected_values: selected,
+      // Populated only when one or more fields fell back to a default.
+      // Empty array means every field matched exactly — no fallbacks triggered.
+      fallbacks_used: fallbacksUsed,
       artifacts: {
         directory: tmpDir,
         before_submit_screenshot: beforeSubmitScreenshot,
@@ -877,6 +940,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       submitted,
       test_mode: payload.test_mode,
       selected_values: selected,
+      fallbacks_used: fallbacksUsed,
       failed_stage: stageName,
       error: '[' + stageName + '] ' + error.message,
       artifacts: {
@@ -896,6 +960,7 @@ function timeoutResult(payload, tracker) {
         submitted: false,
         test_mode: payload.test_mode,
         selected_values: payload.selected_values,
+        fallbacks_used: [],
         failed_stage: tracker.stage || 'request timeout',
         error: 'Form automation exceeded ' + REQUEST_TIMEOUT_MS + 'ms before returning a result. Last stage: ' + (tracker.stage || 'unknown'),
         artifacts: {},
@@ -914,7 +979,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'unsafe-only-skip-positive' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'with-field-fallbacks' });
 });
 
 async function submitObservationForm(req, res) {
@@ -924,25 +989,6 @@ async function submitObservationForm(req, res) {
   }
 
   const payload = normalizePayload(req.body || {});
-
-  // The "Positive/Safe Observation" branch reveals an extra required
-  // dropdown ("Positive/Safe Observation") that we don't currently handle.
-  // Reject it explicitly so the caller knows why -- better than letting it
-  // spin up a browser and fail mid-form.
-  // if (payload.type_of_observation === 'Positive/Safe Observation') {
-  //   res.status(200).json({
-  //     success: false,
-  //     submitted: false,
-  //     test_mode: payload.test_mode,
-  //     selected_values: payload.selected_values,
-  //     failed_stage: 'pre-flight',
-  //     error: 'Positive/Safe Observation branch is not currently supported. ' +
-  //       'Send type_of_observation as "Unsafe Act" or "Unsafe Condition".',
-  //     artifacts: {},
-  //   });
-  //   return;
-  // }
-
   const tracker = { stage: 'queued' };
   const result = await Promise.race([fillForm(payload, req, tracker), timeoutResult(payload, tracker)]);
   res.status(200).json(result);
