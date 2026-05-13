@@ -26,7 +26,7 @@ const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 155000)
 // even if n8n sends an unrecognised value the form still submits cleanly.
 // ---------------------------------------------------------------------------
 const FIELD_DEFAULTS = {
-  project_site:             'Bauxite III (BWI100)',
+project_site: 'Bauxite II (BWI100)',
   reporter_name:            'Dominique Palmer',
   reporter_email:           'Palmerdom84@gmail.com',
   company_name:             'Turner Construction',
