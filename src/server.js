@@ -421,27 +421,36 @@ async function chooseLinkedRecord(page, value, addNames, label) {
 
   console.log(`[${label}] search input visible, setting value directly`);
 
-  await searchInput.evaluate((element, nextValue) => {
-    element.focus();
+  const searchHandle = await searchInput.elementHandle({ timeout: 8000 });
 
-    const setter = Object.getOwnPropertyDescriptor(
-      HTMLInputElement.prototype,
-      'value'
-    )?.set;
+if (!searchHandle) {
+  throw new Error('Search input handle could not be created.');
+}
 
-    if (setter) {
-      setter.call(element, nextValue);
-    } else {
-      element.value = nextValue;
-    }
+await searchHandle.evaluate((element, nextValue) => {
+  element.focus();
 
-    element.dispatchEvent(new Event('input', { bubbles: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
-    element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-    element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
-  }, String(value));
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLInputElement.prototype,
+    'value'
+  )?.set;
 
-  await page.waitForTimeout(1500);
+  if (setter) {
+    setter.call(element, nextValue);
+  } else {
+    element.value = nextValue;
+  }
+
+  element.dispatchEvent(new Event('input', { bubbles: true }));
+  element.dispatchEvent(new Event('change', { bubbles: true }));
+  element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+}, String(value));
+
+await page.waitForTimeout(1500);
+
+await page.waitForTimeout(1500);
+
 
   const visibleBeforePick = await listVisibleOptions(page);
   console.log(`[${label}] visible options after search:`, visibleBeforePick);
@@ -1284,7 +1293,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v8-debug-payload-logs' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v11-project-elementhandle-fix' });
 });
 
 function safeLogPayload(label, data) {
