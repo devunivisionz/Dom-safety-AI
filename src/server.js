@@ -552,72 +552,68 @@ async function typeIntoComboboxInput(page, input, value) {
 }
 
 // ---------------------------------------------------------------------------
-// findDateInput / findTimeInput
-//
-// Airtable renders date and time as combobox-style <input> elements. Their
-// placeholder text has varied across form versions:
-//   Date: "mm/dd/yyyy"  |  "MM/DD/YYYY"  |  "Date"  |  aria-label match
-//   Time: "hh:mm pm"    |  "HH:MM"       |  "Time"  |  aria-label match
-//
-// We try every known selector in order and return the first one that becomes
-// visible within the given timeout. This avoids hard-coding a single selector
-// that breaks whenever Airtable updates their form renderer.
+// sniffInputSelectors
+// Dumps every <input> in the DOM with its placeholder, aria-label, type,
+// position, and visibility. Logged when date/time selectors all miss so the
+// real selector can be identified from Render logs without re-deploying.
 // ---------------------------------------------------------------------------
-async function findDateInput(page, timeout = ACTION_TIMEOUT_MS) {
-  const selectors = [
+async function sniffInputSelectors(page) {
+  return page.evaluate(() =>
+    Array.from(document.querySelectorAll('input')).map((el) => {
+      const box = el.getBoundingClientRect();
+      return {
+        placeholder: el.placeholder || '',
+        ariaLabel:   el.getAttribute('aria-label') || '',
+        type:        el.type || '',
+        name:        el.name || '',
+        id:          el.id || '',
+        className:   el.className ? String(el.className).slice(0, 80) : '',
+        visible:     box.width > 0 && box.height > 0,
+        x: Math.round(box.x),
+        y: Math.round(box.y),
+      };
+    })
+  ).catch(() => []);
+}
+
+// ---------------------------------------------------------------------------
+// pickDate / pickTime
+//
+// Airtable's date/time inputs vary across form versions. We try every known
+// selector pattern. If none match within the budget we log all visible inputs
+// (so you can identify the real selector from logs) and skip gracefully —
+// date/time are NOT form-blocking; the run continues without them.
+// ---------------------------------------------------------------------------
+async function pickDate(page, isoDate) {
+  if (!isoDate) return '';
+  const label = airtableDateLabel(isoDate);
+
+  const strategies = [
     'input[placeholder*="mm/dd"]',
     'input[placeholder*="MM/DD"]',
     'input[placeholder*="date" i]',
     'input[aria-label*="date" i]',
-    'input[aria-label*="Date" i]',
+    '[data-fieldname*="date" i] input',
+    '[data-columnname*="date" i] input',
+    '[role="combobox"][aria-label*="date" i]',
   ];
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    for (const sel of selectors) {
-      const loc = page.locator(sel).first();
-      if (await loc.isVisible({ timeout: 400 }).catch(() => false)) return loc;
-    }
-    // Last resort: any visible input inside a cell that contains the word "date"
-    const cellInput = page
-      .locator('[data-columnname*="date" i] input, [data-fieldname*="date" i] input')
-      .first();
-    if (await cellInput.isVisible({ timeout: 400 }).catch(() => false)) return cellInput;
-    await page.waitForTimeout(300);
-  }
-  return null; // caller decides whether to skip or throw
-}
 
-async function findTimeInput(page, timeout = ACTION_TIMEOUT_MS) {
-  const selectors = [
-    'input[placeholder*="hh:mm"]',
-    'input[placeholder*="HH:MM"]',
-    'input[placeholder*="time" i]',
-    'input[aria-label*="time" i]',
-    'input[aria-label*="Time" i]',
-  ];
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    for (const sel of selectors) {
+  const deadline = Date.now() + 6000;
+  let input = null;
+  outer: while (Date.now() < deadline) {
+    for (const sel of strategies) {
       const loc = page.locator(sel).first();
-      if (await loc.isVisible({ timeout: 400 }).catch(() => false)) return loc;
+      if (await loc.isVisible({ timeout: 300 }).catch(() => false)) { input = loc; break outer; }
     }
-    const cellInput = page
-      .locator('[data-columnname*="time" i] input, [data-fieldname*="time" i] input')
-      .first();
-    if (await cellInput.isVisible({ timeout: 400 }).catch(() => false)) return cellInput;
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(250);
   }
-  return null;
-}
 
-async function pickDate(page, isoDate) {
-  if (!isoDate) return '';
-  const label = airtableDateLabel(isoDate);
-  const input = await findDateInput(page, ACTION_TIMEOUT_MS);
   if (!input) {
-    console.warn('[pickDate] date input not found — skipping date fill. Form will use whatever default Airtable sets.');
-    return '';
+    const all = await sniffInputSelectors(page);
+    console.warn('[pickDate] date input not found. All inputs:', JSON.stringify(all));
+    return ''; // non-fatal
   }
+
   const value = await typeIntoComboboxInput(page, input, label);
   return value || label;
 }
@@ -626,14 +622,37 @@ async function pickTime(page, hhmm) {
   if (!hhmm) return '';
   const [hh24, mm] = hhmm.split(':').map(Number);
   const label = airtableTimeLabel(hh24, mm);
-  const input = await findTimeInput(page, ACTION_TIMEOUT_MS);
-  if (!input) {
-    console.warn('[pickTime] time input not found — skipping time fill.');
-    return '';
+
+  const strategies = [
+    'input[placeholder*="hh:mm"]',
+    'input[placeholder*="HH:MM"]',
+    'input[placeholder*="time" i]',
+    'input[aria-label*="time" i]',
+    '[data-fieldname*="time" i] input',
+    '[data-columnname*="time" i] input',
+    '[role="combobox"][aria-label*="time" i]',
+  ];
+
+  const deadline = Date.now() + 4000;
+  let input = null;
+  outer: while (Date.now() < deadline) {
+    for (const sel of strategies) {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible({ timeout: 300 }).catch(() => false)) { input = loc; break outer; }
+    }
+    await page.waitForTimeout(250);
   }
+
+  if (!input) {
+    const all = await sniffInputSelectors(page);
+    console.warn('[pickTime] time input not found. All inputs:', JSON.stringify(all));
+    return ''; // non-fatal
+  }
+
   const value = await typeIntoComboboxInput(page, input, label);
   return value || label;
 }
+
 
 function artifactUrl(req, path) {
   if (!path) return '';
@@ -687,7 +706,8 @@ function stageTimeout(name) {
   if (name === 'wait Airtable network idle') return 25000;
   if (name === 'wait Airtable form ready') return FORM_READY_TIMEOUT_MS + 5000;
   if (name === 'wait for form inputs') return FORM_READY_TIMEOUT_MS + 5000;
-  if (name === 'fill date' || name === 'fill time') return ACTION_TIMEOUT_MS * 2 + 5000;
+  if (name === 'fill date') return 9000; // 6s search + 3s buffer
+  if (name === 'fill time') return 7000; // 4s search + 3s buffer
   if (name === 'choose project site' || name === 'choose company' || name === 'choose contractor observed') return 45000;
   if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
   return ACTION_TIMEOUT_MS + 5000;
@@ -760,8 +780,8 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     // pickDate / pickTime try multiple selectors and skip gracefully if the
     // input still can't be located (logged as a warning, not a thrown error).
     // -----------------------------------------------------------------------
-    await stage('fill date', () => pickDate(page, payload.date_of_event));
-    await stage('fill time', () => pickTime(page, payload.time));
+    await stage('fill date', () => pickDate(page, payload.date_of_event).catch((e) => console.warn('[fill date] skipped:', e.message)));
+    await stage('fill time', () => pickTime(page, payload.time).catch((e) => console.warn('[fill time] skipped:', e.message)));
 
     // -----------------------------------------------------------------------
     // Project Site — linked-record popover.
@@ -1063,7 +1083,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'with-field-fallbacks-v2-resilient-date' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'with-field-fallbacks-v3-nonfatal-datetime' });
 });
 
 async function submitObservationForm(req, res) {
