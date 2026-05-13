@@ -372,6 +372,8 @@ async function dismissOpenPopover(page) {
 async function chooseLinkedRecord(page, value, addNames, label) {
   if (!value || isUnsetOption(value)) return '';
 
+  console.log(`[${label}] selecting linked record:`, value);
+
   const fieldLabel = page
     .getByText(label, { exact: true })
     .or(page.getByText(labelRegex(label)))
@@ -403,10 +405,10 @@ async function chooseLinkedRecord(page, value, addNames, label) {
   await page.waitForTimeout(300);
 
   await addButton.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
-  await addButton.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+  await addButton.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true, force: true });
 
   const searchInput = page
-    .locator('input[placeholder="Search"], input[placeholder="Find an option"], input[placeholder="Select an option"]')
+    .locator('input[placeholder="Search"], input[placeholder="Find an option"], input[placeholder="Select an option"], input[aria-label="Search"]')
     .first();
 
   if (!(await searchInput.isVisible({ timeout: 8000 }).catch(() => false))) {
@@ -417,32 +419,52 @@ async function chooseLinkedRecord(page, value, addNames, label) {
     );
   }
 
-  await searchInput.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
-  await page.keyboard.press('Control+A').catch(() => undefined);
-  await page.keyboard.press('Delete').catch(() => undefined);
-  await page.keyboard.type(String(value), { delay: 40 });
+  console.log(`[${label}] search input visible, setting value directly`);
 
-  await page.waitForTimeout(1000);
+  await searchInput.evaluate((element, nextValue) => {
+    element.focus();
+
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      'value'
+    )?.set;
+
+    if (setter) {
+      setter.call(element, nextValue);
+    } else {
+      element.value = nextValue;
+    }
+
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+  }, String(value));
+
+  await page.waitForTimeout(1500);
+
+  const visibleBeforePick = await listVisibleOptions(page);
+  console.log(`[${label}] visible options after search:`, visibleBeforePick);
 
   const exactOption = page
-    .getByText(String(value), { exact: true })
-    .or(page.getByRole('option', { name: String(value), exact: true }))
+    .getByRole('option', { name: String(value), exact: true })
+    .or(page.getByText(String(value), { exact: true }))
     .first();
 
   if (await exactOption.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await exactOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+    await exactOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true, force: true });
     await page.waitForTimeout(500);
     await page.keyboard.press('Escape').catch(() => undefined);
     return value;
   }
 
   const partialOption = page
-    .getByText(new RegExp(escapeRegExp(value), 'i'))
-    .or(page.getByRole('option', { name: new RegExp(escapeRegExp(value), 'i') }))
+    .getByRole('option', { name: new RegExp(escapeRegExp(value), 'i') })
+    .or(page.getByText(new RegExp(escapeRegExp(value), 'i')))
     .first();
 
   if (await partialOption.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await partialOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+    await partialOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true, force: true });
     await page.waitForTimeout(500);
     await page.keyboard.press('Escape').catch(() => undefined);
     return value;
