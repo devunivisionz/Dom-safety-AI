@@ -1064,35 +1064,49 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     // Positive/Safe Observation dropdown (only visible on that branch).
     // Fallback: null (skip — it's conditional and optional within that branch).
     // -----------------------------------------------------------------------
-    selected.positive_safe_observation = await stageIfVisible(
-      stage,
-      'choose positive/safe observation',
-      'Positive/Safe Observation',
-      page,
-      () => withFB({
-        fieldName: 'positive_safe_observation',
-        value: payload.positive_safe_observation,
-        defaultValue: FIELD_DEFAULTS.positive_safe_observation, // null → skip on failure
-        primaryFn: () => chooseCombo(page, 'Positive/Safe Observation', payload.positive_safe_observation),
-      })
-    );
+    if (
+  payload.type_of_observation === 'Positive/Safe Observation' &&
+  payload.positive_safe_observation &&
+  !payload.positive_safe_observation.includes('.')
+) {
+  selected.positive_safe_observation = await stageIfVisible(
+    stage,
+    'choose positive/safe observation',
+    'Positive/Safe Observation',
+    page,
+    () => withFB({
+      fieldName: 'positive_safe_observation',
+      value: payload.positive_safe_observation,
+      defaultValue: FIELD_DEFAULTS.positive_safe_observation,
+      primaryFn: () => chooseCombo(page, 'Positive/Safe Observation', payload.positive_safe_observation),
+    })
+  );
+} else {
+  console.log('form-service skipping positive_safe_observation because value is free text or empty');
+  selected.positive_safe_observation = '';
+}
 
     // -----------------------------------------------------------------------
     // Type of Hazard — searchable dropdown (Unsafe Act / Unsafe Condition branch).
     // Fallback: null (skip — hazard type is not always required).
     // -----------------------------------------------------------------------
-    selected.type_of_hazard = await stageIfVisible(
-      stage,
-      'choose type of hazard',
-      'Type of Hazard',
-      page,
-      () => withFB({
-        fieldName: 'type_of_hazard',
-        value: payload.type_of_hazard,
-        defaultValue: FIELD_DEFAULTS.type_of_hazard, // null → skip on failure
-        primaryFn: () => chooseCombo(page, 'Type of Hazard', payload.type_of_hazard),
-      })
-    );
+   if (payload.type_of_observation !== 'Positive/Safe Observation') {
+  selected.type_of_hazard = await stageIfVisible(
+    stage,
+    'choose type of hazard',
+    'Type of Hazard',
+    page,
+    () => withFB({
+      fieldName: 'type_of_hazard',
+      value: payload.type_of_hazard,
+      defaultValue: FIELD_DEFAULTS.type_of_hazard,
+      primaryFn: () => chooseCombo(page, 'Type of Hazard', payload.type_of_hazard),
+    })
+  );
+} else {
+  console.log('form-service skipping type_of_hazard for Positive/Safe Observation');
+  selected.type_of_hazard = '';
+}
 
     // -----------------------------------------------------------------------
     // Severity — combo or radio (Unsafe Act / Unsafe Condition branch).
@@ -1315,7 +1329,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v12-project-dom-query-fix' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v13-skip-positive-free-text-and-hazard' });
 });
 
 function safeLogPayload(label, data) {
