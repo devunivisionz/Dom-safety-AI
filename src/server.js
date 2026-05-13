@@ -73,12 +73,15 @@ const REGEX_SPECIALS = /[\\^$.*+?()[\]{}|]/g;
 
 function normalizeObservation(value) {
   const text = String(value || '').trim().toLowerCase();
+
   if (text.includes('unsafe condition')) return 'Unsafe Condition';
   if (text.includes('unsafe act')) return 'Unsafe Act';
-  if (text.includes('positive') || text.includes('safe observation')) return 'Positive/Safe Observation';
-  return FIELD_DEFAULTS.type_of_observation;
-}
+  if (text.includes('positive') || text.includes('safe observation')) {
+    return 'Positive/Safe Observation';
+  }
 
+  return 'Unsafe Condition';
+}
 function normalizeStopWork(value) {
   const text = String(value || '').trim().toLowerCase();
   return ['yes', 'true', 'checked', '1'].includes(text) ? 'Yes' : 'Not Required';
@@ -114,7 +117,17 @@ function normalizePayload(body) {
   return defaultValue;
 }
   const dateTime = splitDateTime(body.date_of_event, body.time);
-  const observation = normalizeObservation(body.type_of_observation);
+  let observation = normalizeObservation(body.type_of_observation);
+
+// If Positive/Safe Observation is selected but the required
+// Positive/Safe Observation dropdown value is empty, do not go into
+// that branch because Airtable will require another value.
+if (
+  observation === 'Positive/Safe Observation' &&
+  !clean(body.positive_safe_observation)
+) {
+  observation = 'Unsafe Condition';
+}
   const severity = normalizeSeverity(body.severity);
   const stopWork = normalizeStopWork(body.stop_work_authority_used);
   const followUp = normalizeFollowUp(body.followup_status);
