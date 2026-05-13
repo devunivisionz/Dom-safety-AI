@@ -432,12 +432,72 @@ async function dismissCookieBanner(page) {
 }
 
 async function chooseRadio(page, groupLabel, optionLabel) {
-  const group = page
-    .getByRole('radiogroup', { name: groupLabel, exact: true })
-    .or(page.getByRole('radiogroup', { name: labelRegex(groupLabel) }))
-    .first();
-  await group.getByRole('radio', { name: optionLabel, exact: true }).check();
-  return optionLabel;
+  // Airtable interface forms render radio groups as styled pill buttons,
+  // NOT as native <input type="radio"> elements. The pills are clickable
+  // divs/spans inside a container near the group label. We use a multi-
+  // strategy approach so this works regardless of the exact DOM structure.
+
+  const optionRegex = new RegExp(escapeRegExp(optionLabel), 'i');
+
+  // Strategy 1: standard radiogroup + radio role (works if Airtable uses ARIA)
+  try {
+    const group = page
+      .getByRole('radiogroup', { name: groupLabel, exact: true })
+      .or(page.getByRole('radiogroup', { name: labelRegex(groupLabel) }))
+      .first();
+    const radio = group
+      .getByRole('radio', { name: optionLabel, exact: true })
+      .or(group.getByRole('radio', { name: optionRegex }))
+      .first();
+    if (await radio.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await radio.check({ timeout: ACTION_TIMEOUT_MS });
+      return optionLabel;
+    }
+  } catch { /* fall through */ }
+
+  // Strategy 2: find the group label, scope to its field container,
+  // then click the pill whose text matches optionLabel.
+  // The field container is identified by walking up from the label until
+  // we find a node that also contains the option text.
+  try {
+    const labelLoc = page
+      .getByText(groupLabel, { exact: true })
+      .or(page.getByText(labelRegex(groupLabel)))
+      .first();
+
+    if (await labelLoc.isVisible({ timeout: 2000 }).catch(() => false)) {
+      // Walk up at most 6 ancestors to find a container that holds the option
+      for (let depth = 1; depth <= 6; depth++) {
+        const xpath = 'xpath=ancestor::*[' + depth + ']';
+        const container = labelLoc.locator(xpath);
+        const pill = container
+          .getByText(optionLabel, { exact: true })
+          .or(container.getByText(optionRegex))
+          .first();
+        if (await pill.isVisible({ timeout: 800 }).catch(() => false)) {
+          await pill.click({ timeout: ACTION_TIMEOUT_MS });
+          return optionLabel;
+        }
+      }
+    }
+  } catch { /* fall through */ }
+
+  // Strategy 3: find the pill anywhere on the page by its exact text and click it.
+  // Safe because each option label is unique on this form.
+  try {
+    const pill = page
+      .getByText(optionLabel, { exact: true })
+      .or(page.getByText(optionRegex))
+      .first();
+    if (await pill.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await pill.click({ timeout: ACTION_TIMEOUT_MS });
+      return optionLabel;
+    }
+  } catch { /* fall through */ }
+
+  throw new Error(
+    'chooseRadio: could not find or click option "' + optionLabel + '" in group "' + groupLabel + '"'
+  );
 }
 
 async function chooseComboOrRadio(page, label, value) {
@@ -772,6 +832,8 @@ function stageTimeout(name) {
   if (name === 'fill date') return 9000; // 6s search + 3s buffer
   if (name === 'fill time') return 7000; // 4s search + 3s buffer
   if (name === 'choose project site' || name === 'choose company' || name === 'choose contractor observed') return 45000;
+  if (name === 'choose type of observation' || name === 'choose stop work authority' || name === 'choose follow-up status') return 20000;
+  if (name === 'choose severity' || name === 'choose type of hazard' || name === 'choose positive/safe observation') return 20000;
   if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
   return ACTION_TIMEOUT_MS + 5000;
 }
@@ -1153,7 +1215,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v4-click-based-datetime' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v5-pill-radio' });
 });
 
 async function submitObservationForm(req, res) {
