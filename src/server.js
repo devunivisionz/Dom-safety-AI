@@ -737,43 +737,52 @@ async function waitForNewInput(page, alreadyVisible, timeoutMs = 3000) {
   return null;
 }
 
-async function fillInputByPlaceholder(page, placeholderPart, value) {
+async function setInputValueByPlaceholder(page, placeholderPart, value) {
   if (!value) return '';
 
-  const input = page
-    .locator(`input[placeholder*="${placeholderPart}"]`)
-    .first();
+  const input = page.locator(`input[placeholder*="${placeholderPart}"]`).first();
 
   if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) {
     console.warn(`[${placeholderPart}] input not visible, skipping`);
     return '';
   }
 
-  await input.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => undefined);
-  await input.click({ timeout: 5000, noWaitAfter: true });
+  await input.evaluate((element, nextValue) => {
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      'value'
+    )?.set;
 
-  await page.keyboard.press('Control+A').catch(() => undefined);
-  await page.keyboard.press('Delete').catch(() => undefined);
-  await page.keyboard.type(String(value), { delay: 20 });
+    if (setter) {
+      setter.call(element, nextValue);
+    } else {
+      element.value = nextValue;
+    }
+
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+    element.dispatchEvent(new Event('blur', { bubbles: true }));
+  }, String(value));
+
   await page.keyboard.press('Escape').catch(() => undefined);
-
   await page.waitForTimeout(200);
+
   return value;
 }
 
 async function pickDate(page, isoDate) {
   if (!isoDate) return '';
 
-  const label = airtableDateLabel(isoDate); // M/D/YYYY
-  return fillInputByPlaceholder(page, 'mm/dd', label);
+  const label = airtableDateLabel(isoDate);
+  return setInputValueByPlaceholder(page, 'mm/dd', label);
 }
 
 async function pickTime(page, hhmm) {
   if (!hhmm) return '';
 
   const [hh24, mm] = hhmm.split(':').map(Number);
-  const label = airtableTimeLabel(hh24, mm); // h:mmam / h:mmpm
-  return fillInputByPlaceholder(page, 'hh:mm', label);
+  const label = airtableTimeLabel(hh24, mm);
+  return setInputValueByPlaceholder(page, 'hh:mm', label);
 }
 
 function artifactUrl(req, path) {
@@ -1250,7 +1259,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v5-pill-radio' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v7-time-direct-setter-observation-fallback' });
 });
 
 async function submitObservationForm(req, res) {
