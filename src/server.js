@@ -26,7 +26,7 @@ const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 155000)
 // even if n8n sends an unrecognised value the form still submits cleanly.
 // ---------------------------------------------------------------------------
 const FIELD_DEFAULTS = {
-project_site: 'Bauxite II (BWI100)',
+project_site: 'Bauxite II (BWI110)',
   reporter_name:            'Dominique Palmer',
   reporter_email:           'Palmerdom84@gmail.com',
   company_name:             'Turner Construction',
@@ -1119,10 +1119,13 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     // -----------------------------------------------------------------------
     // Corrective Action — free text, no enum fallback needed.
     // -----------------------------------------------------------------------
-    await stage('fill corrective action', () =>
-      fillText(page, 'Corrective Action', payload.corrective_action)
-    );
-
+   await stageIfVisible(
+  stage,
+  'fill corrective action',
+  'Corrective Action',
+  page,
+  () => fillText(page, 'Corrective Action', payload.corrective_action)
+);
     // -----------------------------------------------------------------------
     // Follow-up Status — radio group.
     // Fallback: FIELD_DEFAULTS.followup_status ("Follow Up Needed")
