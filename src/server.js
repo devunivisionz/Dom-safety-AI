@@ -477,35 +477,47 @@ await page.waitForTimeout(1500);
   const visibleBeforePick = await listVisibleOptions(page);
   console.log(`[${label}] visible options after search:`, visibleBeforePick);
 
-  const exactOption = page
-    .getByRole('option', { name: String(value), exact: true })
-    .or(page.getByText(String(value), { exact: true }))
-    .first();
+  const clickedOption = await page.evaluate((targetValue) => {
+  const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ');
 
-  if (await exactOption.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await exactOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true, force: true });
-    await page.waitForTimeout(500);
-    await page.keyboard.press('Escape').catch(() => undefined);
-    return value;
-  }
+  const nodes = Array.from(document.querySelectorAll(
+    '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, div'
+  ));
 
-  const partialOption = page
-    .getByRole('option', { name: new RegExp(escapeRegExp(value), 'i') })
-    .or(page.getByText(new RegExp(escapeRegExp(value), 'i')))
-    .first();
+  const target = normalize(targetValue);
 
-  if (await partialOption.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await partialOption.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true, force: true });
-    await page.waitForTimeout(500);
-    await page.keyboard.press('Escape').catch(() => undefined);
-    return value;
-  }
+  const match = nodes.find((node) => {
+    const style = window.getComputedStyle(node);
+    const box = node.getBoundingClientRect();
+    const text = normalize(node.textContent);
 
-  const visible = await listVisibleOptions(page);
-  throw new Error(
-    'No matching project option found for "' + value + '". Visible options: ' +
-    (visible.length ? visible.join(' | ') : 'none')
-  );
+    return (
+      style.visibility !== 'hidden' &&
+      style.display !== 'none' &&
+      box.width > 0 &&
+      box.height > 0 &&
+      text === target
+    );
+  });
+
+  if (!match) return false;
+
+  match.scrollIntoView({ block: 'center' });
+  match.click();
+  return true;
+}, String(value));
+
+if (clickedOption) {
+  await page.waitForTimeout(700);
+  await page.keyboard.press('Escape').catch(() => undefined);
+  return value;
+}
+
+const visible = await listVisibleOptions(page);
+throw new Error(
+  'No matching project option found for "' + value + '". Visible options: ' +
+  (visible.length ? visible.join(' | ') : 'none')
+);
 }
 
 async function chooseLinkedProject(page, value) {
