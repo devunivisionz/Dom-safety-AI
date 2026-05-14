@@ -8,7 +8,6 @@ import { tmpdir } from 'node:os';
 const app = express();
 
 app.use(express.json({ limit: process.env.JSON_LIMIT || '50mb' }));
-app.use('/artifacts', express.static(tmpdir(), { fallthrough: false }));
 
 const PORT = Number(process.env.PORT || 3000);
 const FORM_URL =
@@ -21,7 +20,6 @@ const SUBMIT_MODE = process.env.FORM_SUBMIT_MODE || 'live';
 const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 15000);
 const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 90000);
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000);
-const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
 
 const FIELD_DEFAULTS = {
@@ -45,19 +43,12 @@ const FOLLOW_UP_LABELS = {
   'Follow Up Needed': 'Follow Up Needed (Se Requiere Seguimiento)',
   NA: 'NA',
 };
-const KNOWN_PROJECT_OPTIONS = ['Bauxite (BW150)', 'Bauxite II (BWI110)', 'Bauxite III (BWI100)', 'Cinco', 'Temple', 'Temple Stampede'];
-const REGEX_SPECIALS = /[\^$.*+?()[\]{}|]/g;
+const KNOWN_PROJECT_OPTIONS = [
+  'Bauxite (BW150)', 'Bauxite II (BWI110)', 'Bauxite III (BWI100)',
+  'Cinco', 'Temple', 'Temple Stampede',
+];
 
 function clean(v) { return v === undefined || v === null ? '' : String(v).trim(); }
-function escapeRegExp(v) { return String(v).replace(REGEX_SPECIALS, '\\$&'); }
-function labelRegex(label) {
-  const escaped = escapeRegExp(label).replace(/\\ /g, '\\s+');
-  return new RegExp('^\\s*' + escaped + '\\s*\\??\\s*:?\\s*$', 'i');
-}
-function isUnsetOption(v) {
-  const t = clean(v).toLowerCase();
-  return !t || t === 'none' || t === 'n/a' || t === 'na' || t === 'unknown';
-}
 function getBody(rb) { return Array.isArray(rb) ? (rb[0] || {}) : (rb || {}); }
 
 function normalizeObservation(v) {
@@ -111,6 +102,7 @@ function normalizePayload(rawBody) {
     reporter_email: clean(body.reporter_email) || FIELD_DEFAULTS.reporter_email,
     company_name: clean(body.company_name) || FIELD_DEFAULTS.company_name,
     type_of_observation: obs,
+    type_of_hazard: clean(body.type_of_hazard),
     positive_safe_observation: clean(body.positive_safe_observation),
     stop_work_authority_used: sw,
     description_of_event: clean(body.description_of_event),
@@ -118,8 +110,6 @@ function normalizePayload(rawBody) {
     followup_status: fu,
     photo_base64: clean(body.photo_base64),
     photo_url: clean(body.photo_url),
-    photo_filename: clean(body.photo_filename) || (clean(body.record_id) ? `safety-observation-${clean(body.record_id)}.jpg` : 'safety-observation.jpg'),
-    photo_content_type: clean(body.photo_content_type) || 'image/jpeg',
     selected_values: {
       type_of_observation: TYPE_OF_OBSERVATION_LABELS[obs],
       stop_work_authority_used: STOP_WORK_LABELS[sw],
@@ -128,467 +118,265 @@ function normalizePayload(rawBody) {
   };
 }
 
-function byLabel(page, label) {
-  return page.getByLabel(label, { exact: true }).or(page.getByLabel(labelRegex(label))).first();
-}
-
-async function fillText(page, label, value) {
-  if (!value) return '';
-  console.log(`[fillText] filling "${label}" with:`, value);
-  const labelLocator = page.getByText(label, { exact: true }).or(page.getByText(labelRegex(label))).first();
-  await labelLocator.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
-  try {
-    const field = byLabel(page, label);
-    if (await field.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await field.fill(String(value), { timeout: 5000 });
-      return value;
-    }
-  } catch {}
-  const filled = await page.evaluate(({ labelText, nextValue }) => {
-    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
-    const allNodes = Array.from(document.querySelectorAll('div, label, span, p'));
-    const labelNode = allNodes.find((node) => {
-      const s = window.getComputedStyle(node);
-      const b = node.getBoundingClientRect();
-      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0 && normalize(node.textContent).includes(labelText);
-    });
-    if (!labelNode) return false;
-    const lb = labelNode.getBoundingClientRect();
-    const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]), textarea'));
-    const candidates = inputs.filter((i) => {
-      const s = window.getComputedStyle(i);
-      const b = i.getBoundingClientRect();
-      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0 && b.top >= lb.top - 10;
-    }).sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-    const input = candidates[0];
-    if (!input) return false;
-    input.focus();
-    const proto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-    if (setter) setter.call(input, nextValue); else input.value = nextValue;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('blur', { bubbles: true }));
-    return true;
-  }, { labelText: label, nextValue: String(value) });
-  if (!filled) { console.warn(`[fillText] unable to fill "${label}", continuing`); return ''; }
-  return value;
-}
-
-async function listVisibleOptions(page) {
-  return page.evaluate(() => {
-    const out = []; const seen = new Set();
-    const nodes = Array.from(document.querySelectorAll('[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, div, span'));
-    for (const n of nodes) {
-      const s = window.getComputedStyle(n);
-      const b = n.getBoundingClientRect();
-      if (s.visibility === 'hidden' || s.display === 'none') continue;
-      if (b.width === 0 || b.height === 0) continue;
-      const t = (n.textContent || '').trim().replace(/\s+/g, ' ');
-      if (!t || seen.has(t)) continue;
-      seen.add(t); out.push(t);
-      if (out.length >= 50) break;
-    }
-    return out;
-  }).catch(() => []);
-}
-
-async function dismissOpenPopover(page) {
-  await page.keyboard.press('Escape').catch(() => undefined);
-  await page.waitForTimeout(300);
-}
-
-async function clickVisibleText(page, targetValue, options = {}) {
-  const { maxTextLength = 160, allowPartial = true, preferExact = true } = options;
-  return page.evaluate(({ targetValue, maxTextLength, allowPartial, preferExact }) => {
-    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
-    const target = normalize(targetValue); const lt = target.toLowerCase();
-    const nodes = Array.from(document.querySelectorAll('[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, label, span, div'));
-    const vn = nodes.map((n) => {
-      const s = window.getComputedStyle(n); const b = n.getBoundingClientRect();
-      const t = normalize(n.textContent);
-      return { node: n, text: t, lowerText: t.toLowerCase(), style: s, box: b };
-    }).filter(({ style, box, text }) => (style.visibility !== 'hidden' && style.display !== 'none' && box.width > 0 && box.height > 0 && text && text.length <= maxTextLength));
-    let match = null;
-    if (preferExact) match = vn.find(({ text }) => text === target);
-    if (!match && allowPartial) match = vn.find(({ lowerText }) => lowerText.includes(lt) || lt.includes(lowerText));
-    if (!match) return false;
-    match.node.scrollIntoView({ block: 'center' });
-    match.node.click();
-    return true;
-  }, { targetValue, maxTextLength, allowPartial, preferExact });
-}
-
-async function setSearchInputValue(page, value) {
-  return page.evaluate((nv) => {
-    const inputs = Array.from(document.querySelectorAll('input[placeholder="Search"], input[placeholder="Find an option"], input[placeholder="Select an option"], input[aria-label="Search"], input[role="combobox"]'));
-    const vi = inputs.find((e) => {
-      const s = window.getComputedStyle(e); const b = e.getBoundingClientRect();
-      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
-    });
-    if (!vi) return false;
-    vi.focus();
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-    if (setter) { setter.call(vi, ''); setter.call(vi, nv); } else { vi.value = ''; vi.value = nv; }
-    vi.dispatchEvent(new Event('input', { bubbles: true }));
-    vi.dispatchEvent(new Event('change', { bubbles: true }));
-    return true;
-  }, String(value)).catch(() => false);
-}
-
-async function clickFirstSmallOption(page) {
-  return page.evaluate(() => {
-    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
-    const nodes = Array.from(document.querySelectorAll('[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, span, div'));
-    const c = nodes.map((n) => ({ node: n, style: window.getComputedStyle(n), box: n.getBoundingClientRect(), text: normalize(n.textContent) })).filter(({ style, box, text }) => style.visibility !== 'hidden' && style.display !== 'none' && box.width > 0 && box.height > 0 && text && text.length <= 120 && !/submit|clear form|report malicious|do not submit/i.test(text));
-    const cand = c[0]; if (!cand) return '';
-    cand.node.scrollIntoView({ block: 'center' }); cand.node.click();
-    return cand.text;
-  }).catch(() => '');
-}
-
-async function chooseLinkedRecord(page, value, addNames, label, fallbackValues = []) {
-  if (!value || isUnsetOption(value)) return '';
-  console.log(`[${label}] selecting linked record:`, value);
-  await dismissOpenPopover(page);
-  const fieldLabel = page.getByText(label, { exact: true }).or(page.getByText(labelRegex(label))).first();
-  await fieldLabel.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
-
-  let addButton = null;
-  for (const an of addNames) {
-    const r = new RegExp('\\+?\\s*Add\\s+.*' + escapeRegExp(an), 'i');
-    const cand = page.getByRole('button', { name: r }).or(page.getByText(r)).first();
-    if (await cand.isVisible({ timeout: 2500 }).catch(() => false)) { addButton = cand; break; }
-  }
-  if (!addButton) {
-    const dc = await clickVisibleText(page, value, { maxTextLength: 160, allowPartial: true, preferExact: true }).catch(() => false);
-    if (dc) { await page.waitForTimeout(700); return value; }
-    throw new Error('No "+ Add" button found for linked field "' + label + '"');
-  }
-  await addButton.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
-  await addButton.click({ timeout: 5000, noWaitAfter: true, force: true });
-  await page.waitForTimeout(1000);
-
-  const vt = [value, ...fallbackValues.filter((x) => x && x !== value)];
-  for (const av of vt) {
-    await setSearchInputValue(page, av);
-    await page.waitForTimeout(1000);
-    const c = await clickVisibleText(page, av, { maxTextLength: 160, allowPartial: true, preferExact: true }).catch(() => false);
-    if (c) { await page.waitForTimeout(700); await page.keyboard.press('Escape').catch(() => undefined); return av; }
-  }
-  const fc = await clickFirstSmallOption(page);
-  if (fc) { await page.waitForTimeout(700); await page.keyboard.press('Escape').catch(() => undefined); return fc; }
-  const v = await listVisibleOptions(page);
-  throw new Error('No matching linked option found for "' + label + '" value "' + value + '". Visible options: ' + (v.length ? v.join(' | ') : 'none'));
-}
-
-async function chooseLinkedProject(page, value) {
-  return chooseLinkedRecord(page, value || FIELD_DEFAULTS.project_site, ['project'], 'Project Site', [value, FIELD_DEFAULTS.project_site, ...KNOWN_PROJECT_OPTIONS].filter(Boolean));
-}
-
-async function chooseRadio(page, groupLabel, optionLabel) {
-  console.log(`[chooseRadio] group="${groupLabel}", option="${optionLabel}"`);
-  const c = await clickVisibleText(page, optionLabel, { maxTextLength: 180, allowPartial: true, preferExact: true }).catch(() => false);
-  if (c) { await page.waitForTimeout(700); await page.keyboard.press('Escape').catch(() => undefined); return optionLabel; }
-  const v = await listVisibleOptions(page);
-  console.warn('Could not click radio "' + optionLabel + '" in "' + groupLabel + '". Visible: ' + (v.length ? v.join(' | ') : 'none'));
-  return optionLabel;
-}
-
-async function checkCheckboxIfPresent(page, label) {
-  try {
-    const cb = byLabel(page, label)
-      .or(page.locator('input[type="checkbox"]:visible').last());
-    
-    await cb.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
-    
-    if (await cb.count()) { 
-      await cb.check({ timeout: 5000, force: true }); 
-      await page.waitForTimeout(500);
-      
-      const isChecked = await cb.isChecked().catch(() => false);
-      console.log(`[checkCheckbox] "${label}" checked: ${isChecked}`);
-      return isChecked;
-    }
-  } catch (e) { 
-    console.warn('[checkCheckboxIfPresent] failed:', e.message);
-    return false; 
-  }
-  return false;
-}
-
-async function withFallback(page, { fieldName, value, defaultValue, primaryFn, fallbackFn, fallbacksUsed, warn = console.warn }) {
-  try { return await primaryFn(); }
-  catch (e) {
-    warn('[fallback] field "' + fieldName + '" value "' + value + '" failed: ' + e.message);
-    fallbacksUsed.push({ field: fieldName, tried: value, usedDefault: defaultValue || null, error: e.message });
-    await dismissOpenPopover(page);
-    if (defaultValue) {
-      try { if (fallbackFn) return await fallbackFn(); }
-      catch (e2) { warn('[fallback] default "' + defaultValue + '" also failed: ' + e2.message); }
-      return defaultValue;
-    }
-    return value || null;
-  }
-}
-
-function airtableDateLabel(iso) { const [y, m, d] = iso.split('-').map(Number); return m + '/' + d + '/' + y; }
-function airtableTimeLabel(h, m) {
-  const mer = h >= 12 ? 'pm' : 'am'; let h12 = h % 12; if (h12 === 0) h12 = 12;
-  return h12 + ':' + String(m).padStart(2, '0') + mer;
-}
-
-async function setInputValueByPlaceholder(page, ph, value) {
-  if (!value) return '';
-  const input = page.locator(`input[placeholder*="${ph}"]`).first();
-  if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) { console.warn(`[${ph}] input not visible, skipping`); return ''; }
-  await input.evaluate((el, nv) => {
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-    if (setter) setter.call(el, nv); else el.value = nv;
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new Event('blur', { bubbles: true }));
-  }, String(value));
-  await page.keyboard.press('Escape').catch(() => undefined);
-  await page.waitForTimeout(200);
-  return value;
-}
-
-async function pickDate(page, iso) { if (!iso) return ''; return setInputValueByPlaceholder(page, 'mm/dd', airtableDateLabel(iso)); }
-async function pickTime(page, hhmm) {
-  if (!hhmm) return '';
-  const [h, m] = hhmm.split(':').map(Number);
-  return setInputValueByPlaceholder(page, 'hh', airtableTimeLabel(h, m));
-}
-
-function artifactUrl(req, p) {
-  if (!p) return '';
-  const origin = req.protocol + '://' + req.get('host');
-  const rel = p.startsWith(tmpdir()) ? p.slice(tmpdir().length).replace(/^\/+/, '') : p;
-  return origin + '/artifacts/' + rel.split('/').map(encodeURIComponent).join('/');
-}
-
-async function safeScreenshot(page, p) {
-  if (!page) return '';
-  try {
-    await withTimeout(page.screenshot({ path: p, fullPage: false, timeout: SCREENSHOT_TIMEOUT_MS }), SCREENSHOT_TIMEOUT_MS + 1000, 'Timed out capturing screenshot');
-    return p;
-  } catch { return ''; }
-}
-
 function withTimeout(promise, ms, msg) {
   let tid;
   const t = new Promise((_, rej) => { tid = setTimeout(() => rej(new Error(msg)), ms); });
   return Promise.race([promise, t]).finally(() => clearTimeout(tid));
 }
 
-async function isFieldVisible(page, label, timeout = 1500) {
-  return page.getByText(label, { exact: true }).or(page.getByText(labelRegex(label))).first().isVisible({ timeout }).catch(() => false);
+function airtableDateLabel(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
+  return m + '/' + d + '/' + y;
 }
-
-async function stageIfVisible(stage, name, label, page, fn) {
-  if (!(await isFieldVisible(page, label))) { console.log('skipping (not visible): ' + name); return null; }
-  return stage(name, fn);
-}
-
-function stageTimeout(name) {
-  if (name === 'launch browser') return 60000;
-  if (name === 'navigate Airtable form') return NAVIGATION_TIMEOUT_MS + 15000;
-  if (name === 'wait Airtable network idle') return 25000;
-  if (name === 'wait Airtable form ready') return FORM_READY_TIMEOUT_MS + 5000;
-  if (name === 'wait for form inputs') return FORM_READY_TIMEOUT_MS + 5000;
-  if (name === 'fill date') return 9000;
-  if (name === 'fill time') return 7000;
-  if (name === 'choose project site') return 60000;
-  if (name === 'fill company') return 20000;
-  if (name === 'choose type of observation' || name === 'choose stop work authority' || name === 'choose follow-up status') return 20000;
-  if (name === 'submit form') return 18000;
-  if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
-  return ACTION_TIMEOUT_MS + 5000;
-}
-
-async function dismissCookieBanner(page) {
-  await page.keyboard.press('Escape').catch(() => undefined);
-  await page.getByRole('button', { name: /close/i }).first().click({ timeout: 2000 }).catch(() => undefined);
-  await page.locator('button[aria-label="Close"]').first().click({ timeout: 2000 }).catch(() => undefined);
+function airtableTimeLabel(h, m) {
+  const mer = h >= 12 ? 'pm' : 'am';
+  let h12 = h % 12;
+  if (h12 === 0) h12 = 12;
+  return h12 + ':' + String(m).padStart(2, '0') + mer;
 }
 
 async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
   const tmpDir = await mkdtemp(join(tmpdir(), 'safety-observation-'));
   const selected = { ...payload.selected_values };
-  const fallbacksUsed = [];
 
   let browser, context, page;
   let submitted = false;
   let stageName = 'initializing';
   let submitOutcome = 'not_attempted';
-  let submitDetail = '';
 
   const stage = async (name, fn) => {
-    stageName = name; tracker.stage = name;
+    stageName = name;
+    tracker.stage = name;
     console.log('form-service stage: ' + name);
-    return withTimeout(Promise.resolve().then(fn), stageTimeout(name), 'Timed out during stage "' + name + '"');
+    return withTimeout(
+      Promise.resolve().then(fn),
+      30000,
+      'Timed out during stage "' + name + '"',
+    );
   };
-  const withFB = (opts) => withFallback(page, { ...opts, fallbacksUsed });
 
   try {
     browser = await stage('launch browser', async () => playwrightChromium.launch({
       headless: true,
-      executablePath: process.env.CHROMIUM_EXECUTABLE_PATH || (await serverlessChromium.executablePath()),
+      executablePath: process.env.CHROMIUM_EXECUTABLE_PATH
+        || (await serverlessChromium.executablePath()),
       args: [...serverlessChromium.args, '--no-sandbox', '--disable-setuid-sandbox'],
     }));
-    context = await stage('create browser context', () => browser.newContext({ viewport: { width: 1280, height: 720 } }));
+
+    context = await stage('create browser context', () =>
+      browser.newContext({ viewport: { width: 1280, height: 900 } }),
+    );
     page = await stage('create page', () => context.newPage());
     page.setDefaultTimeout(ACTION_TIMEOUT_MS);
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
 
+    // Navigate
     await stage('navigate Airtable form', async () => {
       await page.goto(FORM_URL, { waitUntil: 'commit', timeout: NAVIGATION_TIMEOUT_MS });
-      await page.waitForLoadState('domcontentloaded', { timeout: NAVIGATION_TIMEOUT_MS }).catch(() => undefined);
+      await page.waitForLoadState('domcontentloaded', { timeout: NAVIGATION_TIMEOUT_MS })
+        .catch(() => undefined);
     });
-    await stage('wait Airtable network idle', () => page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined));
-    await stage('wait Airtable form ready', () => page.getByText(/Date\s+of\s+event/i).first().waitFor({ timeout: FORM_READY_TIMEOUT_MS }));
-    await stage('dismiss cookie banner', () => dismissCookieBanner(page));
-    await stage('wait for form inputs', async () => {
-      const dl = Date.now() + FORM_READY_TIMEOUT_MS;
-      while (Date.now() < dl) {
-        const v = await page.locator('input:visible').count().catch(() => 0);
-        if (v > 0) return;
-        await page.waitForTimeout(400);
-      }
-      console.warn('[wait for form inputs] no visible inputs — proceeding');
-    });
-
-    await stage('fill date', () => pickDate(page, payload.date_of_event));
-    await stage('fill time', () => pickTime(page, payload.time));
-
-    selected.project_site = await stage('choose project site', () =>
-      withFB({
-        fieldName: 'project_site',
-        value: payload.project_site,
-        defaultValue: FIELD_DEFAULTS.project_site,
-        primaryFn: () => chooseLinkedProject(page, payload.project_site),
-        fallbackFn: () => chooseLinkedProject(page, FIELD_DEFAULTS.project_site),
-      })
+    
+    await stage('wait for form ready', () =>
+      page.getByText(/Date\s+of\s+event/i).first().waitFor({ timeout: FORM_READY_TIMEOUT_MS }),
     );
 
-    await stage('fill reporter name', () => fillText(page, 'Your Name (First and Last)', payload.reporter_name));
-    await stage('fill reporter email', () => fillText(page, 'Your Email Address', payload.reporter_email));
+    // Dismiss overlays
+    await page.keyboard.press('Escape').catch(() => undefined);
+    await page.waitForTimeout(500);
 
-    selected.company_name = await stage('fill company', async () => {
-      const cv = payload.company_name || FIELD_DEFAULTS.company_name;
-      await fillText(page, 'Name of Company', cv);
-      return cv;
-    });
+    // Fill all fields using direct DOM manipulation
+    await stage('fill all fields', async () => {
+      await page.evaluate((data) => {
+        const norm = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+        
+        // Helper to find input near label
+        const findInputNearLabel = (labelText) => {
+          const labels = Array.from(document.querySelectorAll('label, div, span, p'));
+          const lbl = labels.find((n) => {
+            const s = window.getComputedStyle(n);
+            const b = n.getBoundingClientRect();
+            return s.visibility !== 'hidden' && s.display !== 'none'
+              && b.width > 0 && b.height > 0
+              && norm(n.textContent).toLowerCase().includes(labelText.toLowerCase())
+              && norm(n.textContent).length < 80;
+          });
+          if (!lbl) return null;
+          
+          const lb = lbl.getBoundingClientRect();
+          const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'));
+          const candidates = inputs
+            .filter((i) => {
+              const s = window.getComputedStyle(i);
+              const b = i.getBoundingClientRect();
+              return s.visibility !== 'hidden' && s.display !== 'none'
+                && b.width > 0 && b.height > 0 && b.top >= lb.top - 20 && b.top <= lb.bottom + 100;
+            })
+            .sort((a, b) => Math.abs(a.getBoundingClientRect().top - lb.bottom) - Math.abs(b.getBoundingClientRect().top - lb.bottom));
+          return candidates[0] || null;
+        };
 
-    // SKIPPING: Contractor Observed (dropdown causing issues)
-    console.log('[contractor_observed] skipping (dropdown field - may cause timeout)');
-    selected.contractor_observed = null;
+        // Fill text input
+        const fillInput = (labelText, value) => {
+          if (!value) return;
+          const input = findInputNearLabel(labelText);
+          if (input) {
+            input.focus();
+            const proto = input instanceof HTMLTextAreaElement
+              ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            if (setter) setter.call(input, value); else input.value = value;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            input.dispatchEvent(new Event('blur', { bubbles: true }));
+          }
+        };
 
-    const obsLabel = TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation] || TYPE_OF_OBSERVATION_LABELS[FIELD_DEFAULTS.type_of_observation];
-    const obsFallback = TYPE_OF_OBSERVATION_LABELS[FIELD_DEFAULTS.type_of_observation];
+        // Click by text
+        const clickByText = (text, exact = false) => {
+          const t = norm(text);
+          const lt = t.toLowerCase();
+          const all = Array.from(document.querySelectorAll(
+            '[role="option"],[role="radio"],[role="checkbox"],button,label,span,div,li',
+          ));
+          const visible = all.filter((n) => {
+            const s = window.getComputedStyle(n);
+            const b = n.getBoundingClientRect();
+            return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
+          });
+          let match = exact 
+            ? visible.find((n) => norm(n.textContent) === t)
+            : visible.find((n) => norm(n.textContent).toLowerCase().includes(lt));
+          if (match) {
+            match.scrollIntoView({ block: 'nearest' });
+            match.click();
+            return true;
+          }
+          return false;
+        };
 
-    selected.type_of_observation = await stage('choose type of observation', () =>
-      withFB({
-        fieldName: 'type_of_observation',
-        value: obsLabel,
-        defaultValue: obsFallback,
-        primaryFn: () => chooseRadio(page, 'Type of Observation', obsLabel),
-        fallbackFn: () => chooseRadio(page, 'Type of Observation', obsFallback),
-      })
-    );
-
-    // Wait for conditional fields to appear
-    await page.waitForTimeout(1000);
-
-    // SKIPPING: Positive/Safe Observation (conditional field)
-    console.log('[positive_safe_observation] skipping (conditional field)');
-    selected.positive_safe_observation = null;
-
-    // SKIPPING: Type of Hazard (dropdown causing timeout)
-    console.log('[type_of_hazard] skipping (dropdown field - causing timeout)');
-    selected.type_of_hazard = null;
-
-    // SKIPPING: Severity (not required and causing issues)
-    console.log('[severity] skipping (not required)');
-    selected.severity = null;
-
-    selected.confirmation_checked = await stage('check confirmation', () => checkCheckboxIfPresent(page, 'Please check this box'));
-
-    const swLabel = STOP_WORK_LABELS[payload.stop_work_authority_used] || STOP_WORK_LABELS[FIELD_DEFAULTS.stop_work_authority_used];
-    const swFallback = STOP_WORK_LABELS[FIELD_DEFAULTS.stop_work_authority_used];
-
-    selected.stop_work_authority_used = await stage('choose stop work authority', () =>
-      withFB({
-        fieldName: 'stop_work_authority_used',
-        value: swLabel, defaultValue: swFallback,
-        primaryFn: () => chooseRadio(page, 'Stop Work Authority Used?', swLabel),
-        fallbackFn: () => chooseRadio(page, 'Stop Work Authority Used?', swFallback),
-      })
-    );
-
-    await stage('fill description', async () => {
-      const text = payload.description_of_event || payload.positive_safe_observation;
-      if (!text) return;
-      const vA = await isFieldVisible(page, 'Description of Event (original)');
-      await fillText(page, vA ? 'Description of Event (original)' : 'Description of Event', text);
-    });
-
-    await stageIfVisible(stage, 'fill corrective action', 'Corrective Action', page,
-      () => fillText(page, 'Corrective Action', payload.corrective_action)
-    );
-
-    const fuLabel = FOLLOW_UP_LABELS[payload.followup_status] || FOLLOW_UP_LABELS[FIELD_DEFAULTS.followup_status];
-    const fuFallback = FOLLOW_UP_LABELS[FIELD_DEFAULTS.followup_status];
-
-    selected.followup_status = await stage('choose follow-up status', () =>
-      withFB({
-        fieldName: 'followup_status',
-        value: fuLabel, defaultValue: fuFallback,
-        primaryFn: () => chooseRadio(page, 'Was the issue corrected onsite or is follow up needed?', fuLabel),
-        fallbackFn: () => chooseRadio(page, 'Was the issue corrected onsite or is follow up needed?', fuFallback),
-      })
-    );
-
-    if (payload.photo_base64 || payload.photo_url) {
-      await stage('attach photo', async () => {
-        const pp = join(tmpDir, payload.photo_filename);
-        if (payload.photo_base64) {
-          await writeFile(pp, Buffer.from(payload.photo_base64, 'base64'));
-        } else {
-          const r = await fetch(payload.photo_url);
-          if (!r.ok) throw new Error('Unable to download photo_url: ' + r.status + ' ' + r.statusText);
-          await writeFile(pp, Buffer.from(await r.arrayBuffer()));
+        // 1. Date
+        const dateInputs = Array.from(document.querySelectorAll('input[placeholder*="mm/dd"]'));
+        if (dateInputs.length > 0 && data.date_of_event) {
+          const [y, m, d] = data.date_of_event.split('-');
+          dateInputs[0].focus();
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+          if (setter) setter.call(dateInputs[0], `${m}/${d}/${y}`);
+          else dateInputs[0].value = `${m}/${d}/${y}`;
+          dateInputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+          dateInputs[0].dispatchEvent(new Event('change', { bubbles: true }));
         }
-        await page.locator('input[type="file"]').setInputFiles(pp);
+
+        // 2. Time
+        const timeInputs = Array.from(document.querySelectorAll('input[placeholder*="hh"]'));
+        if (timeInputs.length > 0 && data.time) {
+          const [h, m] = data.time.split(':');
+          const hour = parseInt(h);
+          const mer = hour >= 12 ? 'pm' : 'am';
+          const h12 = hour % 12 || 12;
+          timeInputs[0].focus();
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+          if (setter) setter.call(timeInputs[0], `${h12}:${m}${mer}`);
+          else timeInputs[0].value = `${h12}:${m}${mer}`;
+          timeInputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+          timeInputs[0].dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        // 3. Project Site - click Add button then select
+        const addProjectBtn = Array.from(document.querySelectorAll('button')).find(
+          (b) => norm(b.textContent).toLowerCase().includes('add project')
+        );
+        if (addProjectBtn && data.project_site) {
+          addProjectBtn.click();
+          // Wait a bit then search and select
+          setTimeout(() => {
+            const searchBox = Array.from(document.querySelectorAll('input[placeholder*="Search"], input[placeholder*="search"]'))[0];
+            if (searchBox) {
+              searchBox.focus();
+              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+              if (setter) setter.call(searchBox, data.project_site);
+              else searchBox.value = data.project_site;
+              searchBox.dispatchEvent(new Event('input', { bubbles: true }));
+              setTimeout(() => clickByText(data.project_site, false), 500);
+            }
+          }, 1000);
+        }
+
+        // 4. Reporter Name
+        fillInput('Your Name', data.reporter_name);
+
+        // 5. Reporter Email
+        fillInput('Your Email', data.reporter_email);
+
+        // 6. Company Name
+        fillInput('Name of Company', data.company_name);
+
+        // 7. Type of Observation
+        const obsLabel = data.type_of_observation === 'Unsafe Condition' 
+          ? 'Unsafe Condition (Condición insegura)'
+          : data.type_of_observation === 'Unsafe Act'
+          ? 'Unsafe Act (Acto Inseguro)'
+          : 'Positive/Safe Observation (Observación positiva/segura)';
+        clickByText(obsLabel, true);
+
+        // 8. Stop Work Authority
+        const swLabel = data.stop_work_authority_used === 'Yes' 
+          ? 'Yes (Si)' 
+          : 'Not Required (No Requerido)';
+        clickByText(swLabel, true);
+
+        // 9. Description
+        fillInput('Description of Event', data.description_of_event);
+
+        // 10. Follow-up Status
+        const fuLabel = data.followup_status === 'Corrected Onsite'
+          ? 'Corrected Onsite (Corrigdo En El Sitio)'
+          : data.followup_status === 'Follow Up Needed'
+          ? 'Follow Up Needed (Se Requiere Seguimiento)'
+          : 'NA';
+        clickByText(fuLabel, true);
+
+      }, {
+        date_of_event: payload.date_of_event,
+        time: payload.time,
+        project_site: payload.project_site,
+        reporter_name: payload.reporter_name,
+        reporter_email: payload.reporter_email,
+        company_name: payload.company_name,
+        type_of_observation: payload.type_of_observation,
+        stop_work_authority_used: payload.stop_work_authority_used,
+        description_of_event: payload.description_of_event,
+        followup_status: payload.followup_status,
       });
-    }
 
-    const beforeSubmitPath = join(tmpDir, 'before-submit.png');
-    const beforeSubmitScreenshot = await stage('capture before-submit screenshot', () => safeScreenshot(page, beforeSubmitPath));
+      // Wait for all interactions to complete
+      await page.waitForTimeout(3000);
+    });
 
+    // Submit
     submitOutcome = await stage('submit form', async () => {
       const submitButton = page
         .getByRole('button', { name: /Submit Observation/i })
         .or(page.getByRole('button', { name: /^Submit$/i }))
-        .or(page.locator('button:has-text("Submit")'))
         .first();
 
-      await submitButton.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+      await submitButton.scrollIntoViewIfNeeded({ timeout: 5000 });
       const urlBefore = page.url();
 
-      await submitButton.click({ timeout: ACTION_TIMEOUT_MS }).catch((err) => {
+      await submitButton.click({ timeout: 5000 }).catch((err) => {
         throw new Error('Submit click failed: ' + err.message);
       });
 
-      const CAP_MS = 12000;
+      const CAP_MS = 10000;
       const result = await Promise.race([
         page.getByText(/thank you|response has been submitted|submission received|submitted successfully/i)
           .first().waitFor({ state: 'visible', timeout: CAP_MS })
           .then(() => ({ kind: 'success_text' })).catch(() => null),
+
         page.getByText(/required|must be filled|please complete|invalid|missing/i)
           .first().waitFor({ state: 'visible', timeout: CAP_MS })
           .then(() => ({ kind: 'validation_error' })).catch(() => null),
+
         (async () => {
           const start = Date.now();
           while (Date.now() - start < CAP_MS) {
@@ -597,14 +385,17 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           }
           return null;
         })(),
+
         submitButton.waitFor({ state: 'hidden', timeout: CAP_MS })
           .then(() => ({ kind: 'submit_button_hidden' })).catch(() => null),
-        new Promise((resolve) => setTimeout(() => resolve({ kind: 'cap_reached' }), CAP_MS + 200)),
+
+        new Promise((resolve) =>
+          setTimeout(() => resolve({ kind: 'cap_reached' }), CAP_MS + 200),
+        ),
       ]);
 
       const kind = result?.kind || 'cap_reached';
-      submitDetail = JSON.stringify(result || {});
-      console.log('[submit form] outcome signal:', kind, submitDetail);
+      console.log('[submit form] outcome signal:', kind);
 
       if (kind === 'success_text' || kind === 'url_changed' || kind === 'submit_button_hidden') {
         submitted = true;
@@ -614,50 +405,29 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       return 'unclear';
     });
 
-    const afterPath = join(tmpDir, submitted ? 'after-submit-success.png' : (submitOutcome === 'validation_error' ? 'after-submit-validation-error.png' : 'after-submit-unclear.png'));
-    const finalScreenshot = await stage('capture final screenshot', () => safeScreenshot(page, afterPath));
-
-    await withTimeout(context.close(), 5000, 'Timed out closing browser context').catch(() => undefined);
-    await withTimeout(browser.close(), 5000, 'Timed out closing browser').catch(() => undefined);
+    await withTimeout(context.close(), 5000, 'close context timeout').catch(() => undefined);
+    await withTimeout(browser.close(), 5000, 'close browser timeout').catch(() => undefined);
 
     return {
       success: true,
       submitted,
       submit_outcome: submitOutcome,
-      submit_detail: submitDetail,
       test_mode: payload.test_mode,
       submit_mode: SUBMIT_MODE,
       selected_values: selected,
-      fallbacks_used: fallbacksUsed,
-      artifacts: {
-        directory: tmpDir,
-        before_submit_screenshot: beforeSubmitScreenshot,
-        final_screenshot: finalScreenshot,
-        before_submit_screenshot_url: artifactUrl(req, beforeSubmitScreenshot),
-        final_screenshot_url: artifactUrl(req, finalScreenshot),
-      },
     };
 
   } catch (error) {
-    const errorPath = join(tmpDir, 'error.png');
-    const errorScreenshot = await safeScreenshot(page, errorPath);
-    if (context) await withTimeout(context.close(), 5000, 'Timed out closing browser context').catch(() => undefined);
-    if (browser) await withTimeout(browser.close(), 5000, 'Timed out closing browser').catch(() => undefined);
+    if (context) await withTimeout(context.close(), 5000, 'close context timeout').catch(() => undefined);
+    if (browser) await withTimeout(browser.close(), 5000, 'close browser timeout').catch(() => undefined);
     return {
       success: false,
       submitted,
       submit_outcome: submitOutcome,
-      submit_detail: submitDetail,
       test_mode: payload.test_mode,
       selected_values: selected,
-      fallbacks_used: fallbacksUsed,
       failed_stage: stageName,
       error: '[' + stageName + '] ' + error.message,
-      artifacts: {
-        directory: tmpDir,
-        error_screenshot: errorScreenshot,
-        error_screenshot_url: artifactUrl(req, errorScreenshot),
-      },
     };
   }
 }
@@ -666,11 +436,12 @@ function timeoutResult(payload, tracker) {
   return new Promise((resolve) => {
     setTimeout(() => {
       resolve({
-        success: false, submitted: false,
-        test_mode: payload.test_mode, selected_values: payload.selected_values,
-        fallbacks_used: [], failed_stage: tracker.stage || 'request timeout',
-        error: 'Form automation exceeded ' + REQUEST_TIMEOUT_MS + 'ms before returning. Last stage: ' + (tracker.stage || 'unknown'),
-        artifacts: {},
+        success: false,
+        submitted: false,
+        test_mode: payload.test_mode,
+        selected_values: payload.selected_values,
+        failed_stage: tracker.stage || 'request timeout',
+        error: `Form automation exceeded ${REQUEST_TIMEOUT_MS}ms. Last stage: ${tracker.stage || 'unknown'}`,
       });
     }, REQUEST_TIMEOUT_MS);
   });
@@ -678,7 +449,7 @@ function timeoutResult(payload, tracker) {
 
 function safeLogPayload(label, data) {
   const c = JSON.parse(JSON.stringify(data || {}));
-  if (c.photo_base64) c.photo_base64 = '[base64 hidden, length=' + String(data.photo_base64 || '').length + ']';
+  if (c.photo_base64) c.photo_base64 = `[base64 hidden]`;
   if (c.photo_url) c.photo_url = '[photo_url present]';
   console.log(label, JSON.stringify(c, null, 2));
 }
@@ -695,18 +466,25 @@ async function submitObservationForm(req, res) {
   const payload = normalizePayload(req.body || {});
   safeLogPayload('[NORMALIZED PAYLOAD]', payload);
   const tracker = { stage: 'queued' };
-  const result = await Promise.race([fillForm(payload, req, tracker), timeoutResult(payload, tracker)]);
+  const result = await Promise.race([
+    fillForm(payload, req, tracker),
+    timeoutResult(payload, tracker),
+  ]);
   safeLogPayload('[FINAL RESULT]', result);
   console.log('================ FORM REQUEST END ==================');
   res.status(200).json(result);
 }
 
 app.get('/', (req, res) => res.json({
-  ok: true, service: 'AI Safety Manager Form Service',
-  submit_mode: SUBMIT_MODE, version: 'v25-skip-problematic-dropdowns',
+  ok: true,
+  service: 'AI Safety Manager Form Service',
+  submit_mode: SUBMIT_MODE,
+  version: 'v27-minimal-submit',
   endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
 }));
-app.get('/health', (req, res) => res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v25-skip-problematic-dropdowns' }));
+app.get('/health', (req, res) => res.json({
+  ok: true, submit_mode: SUBMIT_MODE, version: 'v27-minimal-submit',
+}));
 app.post('/', submitObservationForm);
 app.post('/submit-observation-form', submitObservationForm);
 
