@@ -916,13 +916,14 @@ function stageTimeout(name) {
   if (name === 'fill date') return 9000;
   if (name === 'fill time') return 7000;
 
-  if (
-    name === 'choose project site' ||
-    name === 'choose company' ||
-    name === 'choose contractor observed'
-  ) {
-    return 90000;
-  }
+ if (
+  name === 'choose project site' ||
+  name === 'choose contractor observed'
+) {
+  return 90000;
+}
+
+if (name === 'fill company') return 20000;
 
   if (
     name === 'choose type of observation' ||
@@ -1104,15 +1105,12 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       fillText(page, 'Your Email Address', payload.reporter_email)
     );
 
-    selected.company_name = await stage('choose company', () =>
-      withFB({
-        fieldName: 'company_name',
-        value: payload.company_name,
-        defaultValue: FIELD_DEFAULTS.company_name,
-        primaryFn: () => chooseLinkedCompany(page, payload.company_name),
-        fallbackFn: () => chooseLinkedCompany(page, FIELD_DEFAULTS.company_name),
-      })
-    );
+   selected.company_name = await stage('fill company', async () => {
+  const companyValue = payload.company_name || FIELD_DEFAULTS.company_name;
+  await fillText(page, 'Name of Company', companyValue);
+  return companyValue;
+   }
+);
 
     if (!isUnsetOption(payload.contractor_observed)) {
       selected.contractor_observed = await stage('choose contractor observed', () =>
