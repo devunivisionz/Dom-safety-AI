@@ -133,7 +133,7 @@ if (
   const followUp = normalizeFollowUp(body.followup_status);
 
   return {
-   test_mode: toBoolean(body.test_mode, true),
+   test_mode: false,
     date_of_event:            dateTime.date,
     time:                     dateTime.time,
     project_site:             clean(body.project_site) || DEFAULTS.project_site,
@@ -525,37 +525,100 @@ async function chooseLinkedProject(page, value) {
 }
 
 async function chooseCombo(page, label, value) {
-  if (!value) return '';
+  if (!value || isUnsetOption(value)) return '';
+
+  console.log(`[${label}] choosing combo value:`, value);
+
   const combo = comboByLabel(page, label);
   await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
-  await combo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true });
+  await combo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true, force: true });
 
-  let search = null;
-  try {
-    search = await waitForPopoverSearch(page, 4000);
-  } catch {
-    // No search input
+  await page.waitForTimeout(500);
+
+  const searchSet = await page.evaluate((nextValue) => {
+    const inputs = Array.from(document.querySelectorAll(
+      'input[placeholder="Search"], input[placeholder="Find an option"], input[placeholder="Select an option"], input[aria-label="Search"], input[role="combobox"]'
+    ));
+
+    const visibleInput = inputs.find((element) => {
+      const style = window.getComputedStyle(element);
+      const box = element.getBoundingClientRect();
+
+      return (
+        style.visibility !== 'hidden' &&
+        style.display !== 'none' &&
+        box.width > 0 &&
+        box.height > 0
+      );
+    });
+
+    if (!visibleInput) return false;
+
+    visibleInput.focus();
+
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      'value'
+    )?.set;
+
+    if (setter) {
+      setter.call(visibleInput, nextValue);
+    } else {
+      visibleInput.value = nextValue;
+    }
+
+    visibleInput.dispatchEvent(new Event('input', { bubbles: true }));
+    visibleInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+    return true;
+  }, String(value));
+
+  if (searchSet) {
+    await page.waitForTimeout(1000);
   }
 
-  if (await clickVisibleOption(page, value, 1500)) return value;
+  const clickedOption = await page.evaluate((targetValue) => {
+    const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ');
 
-  if (!search) {
-    const visible = await listVisibleOptions(page);
-    const suffix = visible.length ? '. Visible options: ' + visible.join(' | ') : '';
-    throw new Error(
-      'Combobox "' + label + '" did not open a searchable popover and "' + value + '" not visible' + suffix
-    );
+    const nodes = Array.from(document.querySelectorAll(
+      '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, div'
+    ));
+
+    const target = normalize(targetValue);
+
+    const match = nodes.find((node) => {
+      const style = window.getComputedStyle(node);
+      const box = node.getBoundingClientRect();
+      const text = normalize(node.textContent);
+
+      return (
+        style.visibility !== 'hidden' &&
+        style.display !== 'none' &&
+        box.width > 0 &&
+        box.height > 0 &&
+        text === target
+      );
+    });
+
+    if (!match) return false;
+
+    match.scrollIntoView({ block: 'center' });
+    match.click();
+    return true;
+  }, String(value));
+
+  if (clickedOption) {
+    await page.waitForTimeout(700);
+    await page.keyboard.press('Escape').catch(() => undefined);
+    return value;
   }
-
-  const popoverHandle = await popoverContainerFor(search);
-  const picked = await searchAndPick(page, search, value, popoverHandle);
-  if (picked) return value;
 
   const visible = await listVisibleOptions(page);
-  const suffix = visible.length ? '. Visible options: ' + visible.join(' | ') : '';
-  throw new Error('No visible option found for "' + label + '" value "' + value + '"' + suffix);
+  throw new Error(
+    'No visible option found for "' + label + '" value "' + value + '". Visible options: ' +
+    (visible.length ? visible.join(' | ') : 'none')
+  );
 }
-
 async function dismissCookieBanner(page) {
   await page.keyboard.press('Escape').catch(() => undefined);
   await page.getByRole('button', { name: /close/i }).first().click({ timeout: 2000 }).catch(() => undefined);
@@ -1225,7 +1288,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       safeScreenshot(page, beforeSubmitPath)
     );
 
-    const shouldSubmit = payload.test_mode === false && SUBMIT_MODE === 'live';
+    const shouldSubmit = true;
 
 if (shouldSubmit) {
   await stage('submit form', async () => {
@@ -1341,7 +1404,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v13-skip-positive-free-text-and-hazard' });
+  res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v14-live-submit-company-dom-click' });
 });
 
 function safeLogPayload(label, data) {
