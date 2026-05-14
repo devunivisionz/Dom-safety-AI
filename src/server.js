@@ -13,7 +13,7 @@ app.use('/artifacts', express.static(tmpdir(), { fallthrough: false }));
 const PORT = Number(process.env.PORT || 3000);
 const FORM_URL = process.env.AIRTABLE_FORM_URL || 'https://airtable.com/appUOdowBcsT6bVlS/pagzDVVSW2w9Nx1Mz/form';
 const TOKEN = process.env.FORM_SERVICE_TOKEN || '';
-const SUBMIT_MODE = process.env.FORM_SUBMIT_MODE || 'test';
+const SUBMIT_MODE = process.env.FORM_SUBMIT_MODE || 'live';
 const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 10000);
 const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 45000);
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 30000);
