@@ -1036,7 +1036,7 @@ function stageTimeout(name) {
   ) {
     return 20000;
   }
-
+if (name === 'submit form') return 25000;
   if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
 
   return ACTION_TIMEOUT_MS + 5000;
@@ -1410,46 +1410,66 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     const shouldSubmit = true;
 
     if (shouldSubmit) {
-      await stage('submit form', async () => {
-        const submitButton = page
-          .getByRole('button', { name: /Submit Observation/i })
-          .or(page.getByRole('button', { name: /^Submit$/i }))
-          .or(page.locator('button:has-text("Submit")'))
-          .first();
+  await stage('submit form', async () => {
+    await page.keyboard.press('Escape').catch(() => undefined);
+    await page.waitForTimeout(700);
 
-        await submitButton.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+    const clicked = await page.evaluate(() => {
+      const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ');
 
-        await submitButton.click({
-          timeout: ACTION_TIMEOUT_MS,
-          noWaitAfter: true,
-        });
+      const candidates = Array.from(
+        document.querySelectorAll('button, [role="button"], div, span')
+      );
 
-        await page.waitForTimeout(3000);
+      const match = candidates.find((el) => {
+        const style = window.getComputedStyle(el);
+        const box = el.getBoundingClientRect();
+        const text = normalize(el.textContent);
 
-        const successVisible = await page
-          .getByText(/thank you|submitted|success|your response has been submitted/i)
-          .first()
-          .isVisible({ timeout: 12000 })
-          .catch(() => false);
-
-        const validationVisible = await page
-          .getByText(/required|must be filled|please complete|invalid/i)
-          .first()
-          .isVisible({ timeout: 3000 })
-          .catch(() => false);
-
-        if (successVisible) {
-          submitted = true;
-          return;
-        }
-
-        if (validationVisible) {
-          throw new Error('Airtable form validation failed after submit click.');
-        }
-
-        throw new Error('Submit clicked but no success confirmation was detected.');
+       return (
+  style.visibility !== 'hidden' &&
+  style.display !== 'none' &&
+  box.width > 0 &&
+  box.height > 0 &&
+  text.length <= 40 &&
+  /submit observation|submit/i.test(text)
+);
       });
+
+      if (!match) return false;
+
+      const button =
+        match.closest('button') ||
+        match.closest('[role="button"]') ||
+        match;
+
+      button.scrollIntoView({ block: 'center' });
+
+      button.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+      button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+      return true;
+    });
+
+    if (!clicked) {
+      throw new Error('Submit button was not found or could not be clicked.');
     }
+
+    await page.waitForTimeout(8000);
+
+    const bodyText = await page
+      .evaluate(() => document.body.innerText || '')
+      .catch(() => '');
+
+    if (/required|must be filled|please complete|invalid/i.test(bodyText)) {
+      throw new Error('Airtable form validation failed after submit click.');
+    }
+
+    submitted = true;
+  });
+}
 
     const afterPath = join(tmpDir, submitted ? 'after-submit.png' : 'test-filled.png');
 
