@@ -25,7 +25,7 @@ const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
 
 const FIELD_DEFAULTS = {
-  project_site: 'Bauxite II (BWI110)',
+  project_site: 'Bauxite (BW150)',
   reporter_name: 'Dominique Palmer',
   reporter_email: 'Palmerdom84@gmail.com',
   company_name: 'Turner Construction',
@@ -480,7 +480,25 @@ async function chooseLinkedRecord(page, value, addNames, label, fallbackValues =
 }
 
 async function chooseLinkedProject(page, value) {
-  return chooseLinkedRecord(page, value || FIELD_DEFAULTS.project_site, ['project'], 'Project Site', [value, FIELD_DEFAULTS.project_site, ...KNOWN_PROJECT_OPTIONS].filter(Boolean));
+  const requested = clean(value);
+  const safeDefault = 'Bauxite (BW150)';
+
+  const valuesToTry = [
+    requested,
+    safeDefault,
+    FIELD_DEFAULTS.project_site,
+    ...KNOWN_PROJECT_OPTIONS,
+  ].filter(Boolean);
+
+  const uniqueValuesToTry = [...new Set(valuesToTry)];
+
+  return chooseLinkedRecord(
+    page,
+    requested || safeDefault,
+    ['project'],
+    'Project Site',
+    uniqueValuesToTry
+  );
 }
 
 async function chooseComboByPartialMatch(page, label, value, fallbackValues = []) {
@@ -605,60 +623,40 @@ async function withFallback(page, { fieldName, value, defaultValue, primaryFn, f
 async function setInputValueByPlaceholder(page, ph, value) {
   if (!value) return '';
 
-  const selectors = [
-    `input[placeholder*="${ph}"]`,
-    ph.includes('mm/dd') ? 'input[placeholder*="MM/DD"]' : '',
-    ph.includes('mm/dd') ? 'input[aria-label*="Date"]' : '',
-    ph.includes('hh:mm') ? 'input[placeholder*="hh:mm"]' : '',
-    ph.includes('hh:mm') ? 'input[placeholder*="HH:MM"]' : '',
-    ph.includes('hh:mm') ? 'input[aria-label*="Time"]' : '',
-  ].filter(Boolean);
+  const input = page.locator(`input[placeholder*="${ph}"]`).first();
 
-  let input = null;
-
-  for (const selector of selectors) {
-    const candidate = page.locator(selector).first();
-    if (await candidate.isVisible({ timeout: 1500 }).catch(() => false)) {
-      input = candidate;
-      break;
-    }
-  }
-
-  if (!input) {
-    console.warn(`[${ph}] input not visible, trying focused fallback`);
+  if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) {
+    console.warn(`[${ph}] input not visible, skipping`);
     return '';
   }
 
-  await input.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => undefined);
-  await input.click({ timeout: 3000, force: true }).catch(() => undefined);
+  await input.evaluate((el, nv) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
 
-  // Real keyboard input works better with Airtable React fields.
-  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => undefined);
-  await page.keyboard.press('Backspace').catch(() => undefined);
-  await page.keyboard.type(String(value), { delay: 25 });
+    if (setter) setter.call(el, nv);
+    else el.value = nv;
 
-  await input.evaluate((el) => {
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     el.dispatchEvent(new Event('blur', { bubbles: true }));
-  }).catch(() => undefined);
+  }, String(value));
 
-  await page.keyboard.press('Tab').catch(() => undefined);
-  await page.waitForTimeout(300);
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(200);
 
   return value;
 }
 
 function airtableDateLabel(iso) {
   const [y, m, d] = iso.split('-').map(Number);
-  return `${m}/${d}/${y}`;
+  return `${String(m).padStart(2, '0')}/${String(d).padStart(2, '0')}/${y}`;
 }
 
 function airtableTimeLabel(h, m) {
   const mer = h >= 12 ? 'pm' : 'am';
   let h12 = h % 12;
   if (h12 === 0) h12 = 12;
-  return `${h12}:${String(m).padStart(2, '0')}${mer}`;
+  return `${String(h12).padStart(2, '0')}:${String(m).padStart(2, '0')} ${mer}`;
 }
 
 async function pickDate(page, iso) {
@@ -807,15 +805,20 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await stage('fill date', () => pickDate(page, payload.date_of_event));
     await stage('fill time', () => pickTime(page, payload.time));
 
-    selected.project_site = await stage('choose project site', () =>
-      withFB({
-        fieldName: 'project_site',
-        value: payload.project_site,
-        defaultValue: FIELD_DEFAULTS.project_site,
-        primaryFn: () => chooseLinkedProject(page, payload.project_site),
-        fallbackFn: () => chooseLinkedProject(page, FIELD_DEFAULTS.project_site),
-      })
-    );
+    selected.project_site = await stage('choose project site', async () => {
+  const picked = await withFB({
+    fieldName: 'project_site',
+    value: payload.project_site,
+    defaultValue: FIELD_DEFAULTS.project_site,
+    primaryFn: () => chooseLinkedProject(page, payload.project_site),
+    fallbackFn: () => chooseLinkedProject(page, FIELD_DEFAULTS.project_site),
+  });
+
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(1000);
+
+  return picked;
+});
 
     await stage('fill reporter name', () => fillText(page, 'Your Name (First and Last)', payload.reporter_name));
     await stage('fill reporter email', () => fillText(page, 'Your Email Address', payload.reporter_email));
