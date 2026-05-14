@@ -29,10 +29,7 @@ const FIELD_DEFAULTS = {
   reporter_name: 'Dominique Palmer',
   reporter_email: 'Palmerdom84@gmail.com',
   company_name: 'Turner Construction',
-  contractor_observed: null,
   type_of_observation: 'Unsafe Condition',
-  type_of_hazard: 'Arc Flash (Arco eléctrico)',
-  positive_safe_observation: null,
   stop_work_authority_used: 'Not Required',
   followup_status: 'Follow Up Needed',
 };
@@ -49,7 +46,6 @@ const FOLLOW_UP_LABELS = {
   NA: 'NA',
 };
 const KNOWN_PROJECT_OPTIONS = ['Bauxite (BW150)', 'Bauxite II (BWI110)', 'Bauxite III (BWI100)', 'Cinco', 'Temple', 'Temple Stampede'];
-const KNOWN_HAZARD_OPTIONS = ['Aerial Lifts/MEWP (Plataformas elevadoras (MEWP))', 'Arc Flash (Arco eléctrico)', 'Barricades (barricadas)', 'Batteries (Baterías)', 'Concrete/Masonry (Hormigón/Mampostería)'];
 const REGEX_SPECIALS = /[\^$.*+?()[\]{}|]/g;
 
 function clean(v) { return v === undefined || v === null ? '' : String(v).trim(); }
@@ -114,9 +110,7 @@ function normalizePayload(rawBody) {
     reporter_name: clean(body.reporter_name) || FIELD_DEFAULTS.reporter_name,
     reporter_email: clean(body.reporter_email) || FIELD_DEFAULTS.reporter_email,
     company_name: clean(body.company_name) || FIELD_DEFAULTS.company_name,
-    contractor_observed: clean(body.contractor_observed) || 'None',
     type_of_observation: obs,
-    type_of_hazard: clean(body.type_of_hazard) || FIELD_DEFAULTS.type_of_hazard,
     positive_safe_observation: clean(body.positive_safe_observation),
     stop_work_authority_used: sw,
     description_of_event: clean(body.description_of_event),
@@ -136,9 +130,6 @@ function normalizePayload(rawBody) {
 
 function byLabel(page, label) {
   return page.getByLabel(label, { exact: true }).or(page.getByLabel(labelRegex(label))).first();
-}
-function comboByLabel(page, label) {
-  return byLabel(page, label).or(page.getByRole('combobox', { name: label, exact: true })).or(page.getByRole('combobox', { name: labelRegex(label) })).first();
 }
 
 async function fillText(page, label, value) {
@@ -245,14 +236,6 @@ async function setSearchInputValue(page, value) {
   }, String(value)).catch(() => false);
 }
 
-async function chooseFirstMatchingFallback(page, fallbackValues = []) {
-  for (const fv of fallbackValues) {
-    const c = await clickVisibleText(page, fv, { maxTextLength: 160, allowPartial: true, preferExact: true }).catch(() => false);
-    if (c) { await page.waitForTimeout(700); return fv; }
-  }
-  return '';
-}
-
 async function clickFirstSmallOption(page) {
   return page.evaluate(() => {
     const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
@@ -280,10 +263,7 @@ async function chooseLinkedRecord(page, value, addNames, label, fallbackValues =
   if (!addButton) {
     const dc = await clickVisibleText(page, value, { maxTextLength: 160, allowPartial: true, preferExact: true }).catch(() => false);
     if (dc) { await page.waitForTimeout(700); return value; }
-    const fd = await chooseFirstMatchingFallback(page, fallbackValues);
-    if (fd) return fd;
-    const v = await listVisibleOptions(page);
-    throw new Error('No "+ Add" button found for linked field "' + label + '". Visible options: ' + (v.length ? v.join(' | ') : 'none'));
+    throw new Error('No "+ Add" button found for linked field "' + label + '"');
   }
   await addButton.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
   await addButton.click({ timeout: 5000, noWaitAfter: true, force: true });
@@ -306,33 +286,6 @@ async function chooseLinkedProject(page, value) {
   return chooseLinkedRecord(page, value || FIELD_DEFAULTS.project_site, ['project'], 'Project Site', [value, FIELD_DEFAULTS.project_site, ...KNOWN_PROJECT_OPTIONS].filter(Boolean));
 }
 
-async function chooseComboByPartialMatch(page, label, value, fallbackValues = []) {
-  if (!value || isUnsetOption(value)) value = fallbackValues[0] || '';
-  if (!value) return '';
-  console.log(`[${label}] choosing dropdown value:`, value);
-  const combo = comboByLabel(page, label);
-  await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
-  await combo.click({ timeout: ACTION_TIMEOUT_MS, noWaitAfter: true, force: true });
-  await page.waitForTimeout(700);
-
-  const vt = [value, ...fallbackValues.filter((x) => x && x !== value)];
-  for (const av of vt) {
-    await setSearchInputValue(page, av);
-    await page.keyboard.type(String(av), { delay: 10 }).catch(() => undefined);
-    await page.waitForTimeout(800);
-    const c = await clickVisibleText(page, av, { maxTextLength: 180, allowPartial: true, preferExact: true }).catch(() => false);
-    if (c) { await page.waitForTimeout(700); await page.keyboard.press('Escape').catch(() => undefined); return av; }
-  }
-  const fc = await clickFirstSmallOption(page);
-  if (fc) { await page.waitForTimeout(700); await page.keyboard.press('Escape').catch(() => undefined); return fc; }
-  const v = await listVisibleOptions(page);
-  console.warn(`No dropdown option found for "${label}" value "${value}". Continuing. Visible: ${v.length ? v.join(' | ') : 'none'}`);
-  await page.keyboard.press('Escape').catch(() => undefined);
-  return value;
-}
-
-async function chooseCombo(page, label, value) { return chooseComboByPartialMatch(page, label, value, [value]); }
-
 async function chooseRadio(page, groupLabel, optionLabel) {
   console.log(`[chooseRadio] group="${groupLabel}", option="${optionLabel}"`);
   const c = await clickVisibleText(page, optionLabel, { maxTextLength: 180, allowPartial: true, preferExact: true }).catch(() => false);
@@ -344,7 +297,6 @@ async function chooseRadio(page, groupLabel, optionLabel) {
 
 async function checkCheckboxIfPresent(page, label) {
   try {
-    // Try multiple selectors for the confirmation checkbox
     const cb = byLabel(page, label)
       .or(page.locator('input[type="checkbox"]:visible').last());
     
@@ -354,7 +306,6 @@ async function checkCheckboxIfPresent(page, label) {
       await cb.check({ timeout: 5000, force: true }); 
       await page.waitForTimeout(500);
       
-      // Verify it was checked
       const isChecked = await cb.isChecked().catch(() => false);
       console.log(`[checkCheckbox] "${label}" checked: ${isChecked}`);
       return isChecked;
@@ -448,10 +399,9 @@ function stageTimeout(name) {
   if (name === 'wait for form inputs') return FORM_READY_TIMEOUT_MS + 5000;
   if (name === 'fill date') return 9000;
   if (name === 'fill time') return 7000;
-  if (name === 'choose project site' || name === 'choose contractor observed') return 60000;
+  if (name === 'choose project site') return 60000;
   if (name === 'fill company') return 20000;
   if (name === 'choose type of observation' || name === 'choose stop work authority' || name === 'choose follow-up status') return 20000;
-  if (name === 'choose type of hazard' || name === 'choose positive/safe observation') return 20000;
   if (name === 'submit form') return 18000;
   if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
   return ACTION_TIMEOUT_MS + 5000;
@@ -531,18 +481,9 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       return cv;
     });
 
-    if (!isUnsetOption(payload.contractor_observed)) {
-      selected.contractor_observed = await stage('choose contractor observed', () =>
-        withFB({
-          fieldName: 'contractor_observed',
-          value: payload.contractor_observed,
-          defaultValue: FIELD_DEFAULTS.contractor_observed,
-          primaryFn: () => chooseCombo(page, 'Name of Contractor Observed', payload.contractor_observed),
-        })
-      );
-    } else {
-      selected.contractor_observed = '';
-    }
+    // SKIPPING: Contractor Observed (dropdown causing issues)
+    console.log('[contractor_observed] skipping (dropdown field - may cause timeout)');
+    selected.contractor_observed = null;
 
     const obsLabel = TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation] || TYPE_OF_OBSERVATION_LABELS[FIELD_DEFAULTS.type_of_observation];
     const obsFallback = TYPE_OF_OBSERVATION_LABELS[FIELD_DEFAULTS.type_of_observation];
@@ -558,37 +499,18 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     );
 
     // Wait for conditional fields to appear
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1000);
 
-    if (payload.type_of_observation === 'Positive/Safe Observation' && payload.positive_safe_observation && !payload.positive_safe_observation.includes('.')) {
-      selected.positive_safe_observation = await stageIfVisible(stage, 'choose positive/safe observation', 'Positive/Safe Observation', page,
-        () => withFB({
-          fieldName: 'positive_safe_observation',
-          value: payload.positive_safe_observation,
-          defaultValue: FIELD_DEFAULTS.positive_safe_observation,
-          primaryFn: () => chooseCombo(page, 'Positive/Safe Observation', payload.positive_safe_observation),
-        })
-      );
-    } else {
-      selected.positive_safe_observation = '';
-    }
+    // SKIPPING: Positive/Safe Observation (conditional field)
+    console.log('[positive_safe_observation] skipping (conditional field)');
+    selected.positive_safe_observation = null;
 
-    if (payload.type_of_observation !== 'Positive/Safe Observation') {
-      selected.type_of_hazard = await stageIfVisible(stage, 'choose type of hazard', 'Type of Hazard', page,
-        () => withFB({
-          fieldName: 'type_of_hazard',
-          value: payload.type_of_hazard,
-          defaultValue: FIELD_DEFAULTS.type_of_hazard,
-          primaryFn: () => chooseComboByPartialMatch(page, 'Type of Hazard', payload.type_of_hazard, [FIELD_DEFAULTS.type_of_hazard, ...KNOWN_HAZARD_OPTIONS]),
-          fallbackFn: () => chooseComboByPartialMatch(page, 'Type of Hazard', FIELD_DEFAULTS.type_of_hazard, KNOWN_HAZARD_OPTIONS),
-        })
-      );
-    } else {
-      selected.type_of_hazard = '';
-    }
+    // SKIPPING: Type of Hazard (dropdown causing timeout)
+    console.log('[type_of_hazard] skipping (dropdown field - causing timeout)');
+    selected.type_of_hazard = null;
 
-    // SEVERITY REMOVED - Not required and causing issues
-    console.log('[severity] skipping severity field (not required)');
+    // SKIPPING: Severity (not required and causing issues)
+    console.log('[severity] skipping (not required)');
     selected.severity = null;
 
     selected.confirmation_checked = await stage('check confirmation', () => checkCheckboxIfPresent(page, 'Please check this box'));
@@ -645,11 +567,6 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     const beforeSubmitPath = join(tmpDir, 'before-submit.png');
     const beforeSubmitScreenshot = await stage('capture before-submit screenshot', () => safeScreenshot(page, beforeSubmitPath));
 
-    // -------------------------------------------------------------------------
-    // Submit stage: race four success signals in parallel with a 12s cap.
-    // Always return regardless of outcome. The final screenshot lets you
-    // visually confirm what actually happened.
-    // -------------------------------------------------------------------------
     submitOutcome = await stage('submit form', async () => {
       const submitButton = page
         .getByRole('button', { name: /Submit Observation/i })
@@ -786,10 +703,10 @@ async function submitObservationForm(req, res) {
 
 app.get('/', (req, res) => res.json({
   ok: true, service: 'AI Safety Manager Form Service',
-  submit_mode: SUBMIT_MODE, version: 'v24-no-severity',
+  submit_mode: SUBMIT_MODE, version: 'v25-skip-problematic-dropdowns',
   endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
 }));
-app.get('/health', (req, res) => res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v24-no-severity' }));
+app.get('/health', (req, res) => res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v25-skip-problematic-dropdowns' }));
 app.post('/', submitObservationForm);
 app.post('/submit-observation-form', submitObservationForm);
 
