@@ -18,11 +18,11 @@ const FORM_URL =
 const TOKEN = process.env.FORM_SERVICE_TOKEN || '';
 const SUBMIT_MODE = process.env.FORM_SUBMIT_MODE || 'live';
 
-const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 10000);
-const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 45000);
-const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 30000);
+const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 15000);
+const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 90000);
+const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
-const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 155000);
+const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 240000);
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -221,7 +221,6 @@ async function fillText(page, label, value) {
   if (!value) return;
 
   const field = byLabel(page, label);
-
   await field.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
 
   try {
@@ -284,7 +283,7 @@ async function listVisibleOptions(page) {
 
 async function dismissOpenPopover(page) {
   await page.keyboard.press('Escape').catch(() => undefined);
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(300);
 }
 
 async function chooseLinkedRecord(page, value, addNames, label) {
@@ -292,12 +291,14 @@ async function chooseLinkedRecord(page, value, addNames, label) {
 
   console.log(`[${label}] selecting linked record:`, value);
 
+  await dismissOpenPopover(page);
+
   const fieldLabel = page
     .getByText(label, { exact: true })
     .or(page.getByText(labelRegex(label)))
     .first();
 
-  await fieldLabel.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
+  await fieldLabel.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
 
   let addButton = null;
 
@@ -309,26 +310,34 @@ async function chooseLinkedRecord(page, value, addNames, label) {
       .or(page.getByText(addRegex))
       .first();
 
-    if (await candidate.isVisible({ timeout: 3000 }).catch(() => false)) {
+    const visible = await candidate.isVisible({ timeout: 2500 }).catch(() => false);
+
+    if (visible) {
       addButton = candidate;
       break;
     }
   }
 
   if (!addButton) {
-    throw new Error('No "+ Add" button found for linked field "' + label + '"');
+    const visible = await listVisibleOptions(page);
+
+    throw new Error(
+      'No "+ Add" button found for linked field "' +
+        label +
+        '". Visible options: ' +
+        (visible.length ? visible.join(' | ') : 'none')
+    );
   }
 
-  await dismissOpenPopover(page);
+  await addButton.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
 
-  await addButton.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
   await addButton.click({
-    timeout: ACTION_TIMEOUT_MS,
+    timeout: 5000,
     noWaitAfter: true,
     force: true,
   });
 
-  await page.waitForTimeout(700);
+  await page.waitForTimeout(1000);
 
   const searchInput = page
     .locator(
@@ -346,8 +355,6 @@ async function chooseLinkedRecord(page, value, addNames, label) {
         (visible.length ? visible.join(' | ') : 'none')
     );
   }
-
-  console.log(`[${label}] search input visible, setting value directly`);
 
   const searchSet = await page.evaluate((nextValue) => {
     const inputs = Array.from(
@@ -399,7 +406,7 @@ async function chooseLinkedRecord(page, value, addNames, label) {
     const visible = await listVisibleOptions(page);
 
     throw new Error(
-      'Search input was visible by locator but could not be found in DOM for "' +
+      'Search input was visible but could not be set for "' +
         label +
         '". Visible options: ' +
         (visible.length ? visible.join(' | ') : 'none')
@@ -422,7 +429,7 @@ async function chooseLinkedRecord(page, value, addNames, label) {
 
     const target = normalize(targetValue);
 
-    const match = nodes.find((node) => {
+    const exactMatch = nodes.find((node) => {
       const style = window.getComputedStyle(node);
       const box = node.getBoundingClientRect();
       const text = normalize(node.textContent);
@@ -435,6 +442,22 @@ async function chooseLinkedRecord(page, value, addNames, label) {
         text === target
       );
     });
+
+    const partialMatch = nodes.find((node) => {
+      const style = window.getComputedStyle(node);
+      const box = node.getBoundingClientRect();
+      const text = normalize(node.textContent);
+
+      return (
+        style.visibility !== 'hidden' &&
+        style.display !== 'none' &&
+        box.width > 0 &&
+        box.height > 0 &&
+        text.includes(target)
+      );
+    });
+
+    const match = exactMatch || partialMatch;
 
     if (!match) return false;
 
@@ -599,9 +622,7 @@ async function chooseRadio(page, groupLabel, optionLabel) {
       await radio.check({ timeout: ACTION_TIMEOUT_MS });
       return optionLabel;
     }
-  } catch {
-    // continue
-  }
+  } catch {}
 
   try {
     const labelLoc = page
@@ -624,9 +645,7 @@ async function chooseRadio(page, groupLabel, optionLabel) {
         }
       }
     }
-  } catch {
-    // continue
-  }
+  } catch {}
 
   try {
     const pill = page
@@ -638,9 +657,7 @@ async function chooseRadio(page, groupLabel, optionLabel) {
       await pill.click({ timeout: ACTION_TIMEOUT_MS });
       return optionLabel;
     }
-  } catch {
-    // continue
-  }
+  } catch {}
 
   throw new Error(
     'chooseRadio: could not find or click option "' +
@@ -892,7 +909,7 @@ async function stageIfVisible(stage, name, label, page, fn) {
 
 function stageTimeout(name) {
   if (name === 'launch browser') return 60000;
-  if (name === 'navigate Airtable form') return NAVIGATION_TIMEOUT_MS + 5000;
+  if (name === 'navigate Airtable form') return NAVIGATION_TIMEOUT_MS + 15000;
   if (name === 'wait Airtable network idle') return 25000;
   if (name === 'wait Airtable form ready') return FORM_READY_TIMEOUT_MS + 5000;
   if (name === 'wait for form inputs') return FORM_READY_TIMEOUT_MS + 5000;
@@ -904,7 +921,7 @@ function stageTimeout(name) {
     name === 'choose company' ||
     name === 'choose contractor observed'
   ) {
-    return 45000;
+    return 90000;
   }
 
   if (
@@ -930,6 +947,7 @@ function stageTimeout(name) {
 
 async function dismissCookieBanner(page) {
   await page.keyboard.press('Escape').catch(() => undefined);
+
   await page
     .getByRole('button', { name: /close/i })
     .first()
@@ -1002,12 +1020,18 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     page.setDefaultTimeout(ACTION_TIMEOUT_MS);
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
 
-    await stage('navigate Airtable form', () =>
-      page.goto(FORM_URL, {
-        waitUntil: 'domcontentloaded',
+    await stage('navigate Airtable form', async () => {
+      await page.goto(FORM_URL, {
+        waitUntil: 'commit',
         timeout: NAVIGATION_TIMEOUT_MS,
-      })
-    );
+      });
+
+      await page
+        .waitForLoadState('domcontentloaded', {
+          timeout: NAVIGATION_TIMEOUT_MS,
+        })
+        .catch(() => undefined);
+    });
 
     await stage('wait Airtable network idle', () =>
       page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined)
@@ -1501,7 +1525,7 @@ app.get('/', (req, res) => {
     ok: true,
     service: 'AI Safety Manager Form Service',
     submit_mode: SUBMIT_MODE,
-    version: 'v15-company-linked-record-fix',
+    version: 'v16-linked-record-timeout-fix',
     endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
   });
 });
@@ -1510,7 +1534,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     submit_mode: SUBMIT_MODE,
-    version: 'v15-company-linked-record-fix',
+    version: 'v16-linked-record-timeout-fix',
   });
 });
 
