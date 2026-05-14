@@ -562,7 +562,78 @@ async function chooseLinkedRecord(page, value, addNames, label) {
 async function chooseLinkedProject(page, value) {
   return chooseLinkedRecord(page, value, ['project'], 'Project Site');
 }
+async function chooseComboByPartialMatch(page, label, value) {
+  if (!value || isUnsetOption(value)) return '';
 
+  console.log(`[${label}] choosing dropdown value:`, value);
+
+  const combo = comboByLabel(page, label);
+
+  await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+  await combo.click({
+    timeout: ACTION_TIMEOUT_MS,
+    noWaitAfter: true,
+    force: true,
+  });
+
+  await page.waitForTimeout(700);
+
+  const searchText = String(value).trim();
+
+  await page.keyboard.type(searchText, { delay: 20 }).catch(() => undefined);
+
+  await page.waitForTimeout(1000);
+
+  const clicked = await page.evaluate((targetValue) => {
+    const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    const target = normalize(targetValue);
+
+    const nodes = Array.from(
+      document.querySelectorAll(
+        '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, div, span'
+      )
+    );
+
+    const match = nodes.find((node) => {
+      const style = window.getComputedStyle(node);
+      const box = node.getBoundingClientRect();
+      const text = normalize(node.textContent);
+
+      return (
+        style.visibility !== 'hidden' &&
+        style.display !== 'none' &&
+        box.width > 0 &&
+        box.height > 0 &&
+        (
+          text === target ||
+          text.includes(target) ||
+          target.includes(text)
+        )
+      );
+    });
+
+    if (!match) return false;
+
+    match.scrollIntoView({ block: 'center' });
+    match.click();
+
+    return true;
+  }, searchText);
+
+  if (clicked) {
+    await page.waitForTimeout(700);
+    await page.keyboard.press('Escape').catch(() => undefined);
+    return value;
+  }
+
+  const visible = await listVisibleOptions(page);
+
+  throw new Error(
+    `No dropdown option found for "${label}" value "${value}". Visible options: ${
+      visible.length ? visible.join(' | ') : 'none'
+    }`
+  );
+}
 async function chooseLinkedCompany(page, value) {
   return chooseLinkedRecord(page, value, ['company'], 'Name of Company');
 }
@@ -679,66 +750,72 @@ async function chooseCombo(page, label, value) {
 }
 
 async function chooseRadio(page, groupLabel, optionLabel) {
-  const optionRegex = new RegExp(escapeRegExp(optionLabel), 'i');
+  console.log(`[chooseRadio] group="${groupLabel}", option="${optionLabel}"`);
 
-  try {
-    const group = page
-      .getByRole('radiogroup', { name: groupLabel, exact: true })
-      .or(page.getByRole('radiogroup', { name: labelRegex(groupLabel) }))
-      .first();
+  const clicked = await page.evaluate(
+    ({ groupText, optionText }) => {
+      const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ');
 
-    const radio = group
-      .getByRole('radio', { name: optionLabel, exact: true })
-      .or(group.getByRole('radio', { name: optionRegex }))
-      .first();
+      const nodes = Array.from(document.querySelectorAll('label, div, span, button'));
 
-    if (await radio.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await radio.check({ timeout: ACTION_TIMEOUT_MS });
-      return optionLabel;
+      const exactOption = nodes.find((node) => {
+        const style = window.getComputedStyle(node);
+        const box = node.getBoundingClientRect();
+        const text = normalize(node.textContent);
+
+        return (
+          style.visibility !== 'hidden' &&
+          style.display !== 'none' &&
+          box.width > 0 &&
+          box.height > 0 &&
+          text === optionText
+        );
+      });
+
+      const partialOption = nodes.find((node) => {
+        const style = window.getComputedStyle(node);
+        const box = node.getBoundingClientRect();
+        const text = normalize(node.textContent);
+
+        return (
+          style.visibility !== 'hidden' &&
+          style.display !== 'none' &&
+          box.width > 0 &&
+          box.height > 0 &&
+          text.includes(optionText)
+        );
+      });
+
+      const match = exactOption || partialOption;
+
+      if (!match) return false;
+
+      match.scrollIntoView({ block: 'center' });
+      match.click();
+
+      return true;
+    },
+    {
+      groupText: groupLabel,
+      optionText: optionLabel,
     }
-  } catch {}
+  );
 
-  try {
-    const labelLoc = page
-      .getByText(groupLabel, { exact: true })
-      .or(page.getByText(labelRegex(groupLabel)))
-      .first();
+  if (clicked) {
+    await page.waitForTimeout(700);
+    await page.keyboard.press('Escape').catch(() => undefined);
+    return optionLabel;
+  }
 
-    if (await labelLoc.isVisible({ timeout: 2000 }).catch(() => false)) {
-      for (let depth = 1; depth <= 6; depth++) {
-        const container = labelLoc.locator('xpath=ancestor::*[' + depth + ']');
-
-        const pill = container
-          .getByText(optionLabel, { exact: true })
-          .or(container.getByText(optionRegex))
-          .first();
-
-        if (await pill.isVisible({ timeout: 800 }).catch(() => false)) {
-          await pill.click({ timeout: ACTION_TIMEOUT_MS });
-          return optionLabel;
-        }
-      }
-    }
-  } catch {}
-
-  try {
-    const pill = page
-      .getByText(optionLabel, { exact: true })
-      .or(page.getByText(optionRegex))
-      .first();
-
-    if (await pill.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await pill.click({ timeout: ACTION_TIMEOUT_MS });
-      return optionLabel;
-    }
-  } catch {}
+  const visible = await listVisibleOptions(page);
 
   throw new Error(
-    'chooseRadio: could not find or click option "' +
+    'Could not click radio option "' +
       optionLabel +
       '" in group "' +
       groupLabel +
-      '"'
+      '". Visible options: ' +
+      (visible.length ? visible.join(' | ') : 'none')
   );
 }
 
@@ -1261,7 +1338,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
             value: payload.type_of_hazard,
             defaultValue: FIELD_DEFAULTS.type_of_hazard,
             primaryFn: () =>
-              chooseCombo(page, 'Type of Hazard', payload.type_of_hazard),
+  chooseComboByPartialMatch(page, 'Type of Hazard', payload.type_of_hazard),
           })
       );
     } else {
@@ -1597,7 +1674,7 @@ app.get('/', (req, res) => {
     ok: true,
     service: 'AI Safety Manager Form Service',
     submit_mode: SUBMIT_MODE,
-    version: 'v16-linked-record-timeout-fix',
+    version: 'v19-radio-click-fix',
     endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
   });
 });
@@ -1606,7 +1683,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     submit_mode: SUBMIT_MODE,
-    version: 'v16-linked-record-timeout-fix',
+    version: 'v19-radio-click-fix',
   });
 });
 
