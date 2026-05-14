@@ -365,11 +365,63 @@ async function chooseComboOrRadio(page, label, value) {
 }
 
 async function checkCheckboxIfPresent(page, label) {
+  // First try: standard aria-label match (works if the form uses proper labels).
   try {
     const cb = byLabel(page, label);
     if (await cb.count()) { await cb.check(); return true; }
-  } catch { return false; }
-  return false;
+  } catch {}
+
+  // Second try: DOM scan for any visible element containing the label text,
+  // then click the nearest unchecked checkbox-like element.
+  const clicked = await page.evaluate((lbl) => {
+    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+
+    // Find a visible element whose text contains the label.
+    const nodes = Array.from(document.querySelectorAll('label, span, div, p'));
+    const labelNode = nodes.find((n) => {
+      const s = window.getComputedStyle(n);
+      const b = n.getBoundingClientRect();
+      if (s.visibility === 'hidden' || s.display === 'none') return false;
+      if (b.width === 0 || b.height === 0) return false;
+      return normalize(n.textContent).toLowerCase().includes(lbl.toLowerCase());
+    });
+
+    if (!labelNode) return false;
+
+    // Look for a checkbox-like element near the label: a real checkbox input,
+    // role=checkbox, or any clickable element with a check icon.
+    const labelBox = labelNode.getBoundingClientRect();
+    const candidates = Array.from(document.querySelectorAll(
+      'input[type="checkbox"], [role="checkbox"], [aria-checked]'
+    ));
+
+    const near = candidates
+      .map((el) => {
+        const b = el.getBoundingClientRect();
+        const dy = Math.abs(b.top - labelBox.top);
+        const dx = Math.abs(b.left - labelBox.left);
+        return { el, dist: dy + dx, b };
+      })
+      .filter(({ el, b }) => {
+        const s = window.getComputedStyle(el);
+        return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
+      })
+      .sort((a, b) => a.dist - b.dist);
+
+    const target = near[0]?.el;
+    if (!target) return false;
+
+    // If already checked, do nothing.
+    if (target.type === 'checkbox' && target.checked) return true;
+    if (target.getAttribute('aria-checked') === 'true') return true;
+
+    target.scrollIntoView({ block: 'center' });
+    target.click();
+    return true;
+  }, label).catch(() => false);
+
+  if (!clicked) console.log(`[checkCheckboxIfPresent] "${label}" not found or not clickable`);
+  return clicked;
 }
 
 async function withFallback(page, { fieldName, value, defaultValue, primaryFn, fallbackFn, fallbacksUsed, warn = console.warn }) {
@@ -438,7 +490,40 @@ function withTimeout(promise, ms, msg) {
 }
 
 async function isFieldVisible(page, label, timeout = 1500) {
-  return page.getByText(label, { exact: true }).or(page.getByText(labelRegex(label))).first().isVisible({ timeout }).catch(() => false);
+  // First try: anchored regex match on its own line/element.
+  // This catches "Severity", "Severity *", "Severity:" etc as standalone labels.
+  const anchored = page
+    .getByText(label, { exact: true })
+    .or(page.getByText(labelRegex(label)))
+    .first();
+  if (await anchored.isVisible({ timeout }).catch(() => false)) return true;
+
+  // Second try: DOM scan for any visible element whose text starts with the
+  // label as a word. Airtable sometimes wraps labels with adjacent asterisks,
+  // subtitle text, or other inline siblings that break exact-match.
+  const found = await page.evaluate((lbl) => {
+    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+    const target = normalize(lbl);
+    if (!target) return false;
+
+    // Use a word-boundary anchor so "Severity" doesn't match inside
+    // "no severity issues found".
+    const re = new RegExp('^' + target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i');
+
+    const nodes = Array.from(document.querySelectorAll('label, span, div, p, h1, h2, h3, h4'));
+    return nodes.some((n) => {
+      const s = window.getComputedStyle(n);
+      const b = n.getBoundingClientRect();
+      if (s.visibility === 'hidden' || s.display === 'none') return false;
+      if (b.width === 0 || b.height === 0) return false;
+      const text = normalize(n.textContent);
+      // Cap text length so we don't match the whole form body.
+      return text.length <= 80 && re.test(text);
+    });
+  }, label).catch(() => false);
+
+  if (!found) console.log(`[isFieldVisible] "${label}" not found on page`);
+  return found;
 }
 
 async function stageIfVisible(stage, name, label, page, fn) {
@@ -700,6 +785,32 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       submitDetail = JSON.stringify(result || {});
       console.log('[submit form] outcome signal:', kind, submitDetail);
 
+      // If we got a validation error, scrape which fields are flagged so the
+      // caller can see exactly what Airtable rejected -- not just "something
+      // failed".
+      if (kind === 'validation_error') {
+        const fieldErrors = await page.evaluate(() => {
+          const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+          // Airtable typically marks invalid fields by adding a red border
+          // or an error message near the field. We look for both.
+          const errorTexts = Array.from(document.querySelectorAll('*'))
+            .filter((n) => {
+              const s = window.getComputedStyle(n);
+              const b = n.getBoundingClientRect();
+              if (s.visibility === 'hidden' || s.display === 'none') return false;
+              if (b.width === 0 || b.height === 0) return false;
+              const t = normalize(n.textContent);
+              return /required|must be filled|please complete|invalid|missing|cannot be empty/i.test(t)
+                && t.length <= 200;
+            })
+            .map((n) => normalize(n.textContent))
+            .slice(0, 10);
+          return [...new Set(errorTexts)];
+        }).catch(() => []);
+        submitDetail = JSON.stringify({ kind, field_errors: fieldErrors });
+        console.log('[submit form] validation errors visible:', fieldErrors);
+      }
+
       if (kind === 'success_text' || kind === 'url_changed' || kind === 'submit_button_hidden') {
         submitted = true;
         return 'success_' + kind;
@@ -796,10 +907,10 @@ async function submitObservationForm(req, res) {
 
 app.get('/', (req, res) => res.json({
   ok: true, service: 'AI Safety Manager Form Service',
-  submit_mode: SUBMIT_MODE, version: 'v22-submit-race-detection',
+  submit_mode: SUBMIT_MODE, version: 'v23-resilient-visibility',
   endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
 }));
-app.get('/health', (req, res) => res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v22-submit-race-detection' }));
+app.get('/health', (req, res) => res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v23-resilient-visibility' }));
 app.post('/', submitObservationForm);
 app.post('/submit-observation-form', submitObservationForm);
 
