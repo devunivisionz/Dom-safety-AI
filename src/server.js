@@ -32,7 +32,6 @@ const FIELD_DEFAULTS = {
   contractor_observed: null,
   type_of_observation: 'Unsafe Condition',
   type_of_hazard: 'Arc Flash (Arco eléctrico)',
-  severity: 'Medium',
   positive_safe_observation: null,
   stop_work_authority_used: 'Not Required',
   followup_status: 'Follow Up Needed',
@@ -49,7 +48,6 @@ const FOLLOW_UP_LABELS = {
   'Follow Up Needed': 'Follow Up Needed (Se Requiere Seguimiento)',
   NA: 'NA',
 };
-const SEVERITY_LABELS = { Low: 'Low', Medium: 'Medium', High: 'High' };
 const KNOWN_PROJECT_OPTIONS = ['Bauxite (BW150)', 'Bauxite II (BWI110)', 'Bauxite III (BWI100)', 'Cinco', 'Temple', 'Temple Stampede'];
 const KNOWN_HAZARD_OPTIONS = ['Aerial Lifts/MEWP (Plataformas elevadoras (MEWP))', 'Arc Flash (Arco eléctrico)', 'Barricades (barricadas)', 'Batteries (Baterías)', 'Concrete/Masonry (Hormigón/Mampostería)'];
 const REGEX_SPECIALS = /[\^$.*+?()[\]{}|]/g;
@@ -83,12 +81,6 @@ function normalizeFollowUp(v) {
   if (t === 'na' || t === 'n/a' || t.includes('not applicable')) return 'NA';
   return 'Follow Up Needed';
 }
-function normalizeSeverity(v) {
-  const t = String(v || '').trim().toLowerCase();
-  if (t === 'low') return 'Low';
-  if (t === 'high') return 'High';
-  return 'Medium';
-}
 
 function splitDateTime(d, t) {
   const fb = new Date();
@@ -111,7 +103,6 @@ function normalizePayload(rawBody) {
   const dt = splitDateTime(body.date_of_event, body.time);
   let obs = normalizeObservation(body.type_of_observation);
   if (obs === 'Positive/Safe Observation' && !clean(body.positive_safe_observation)) obs = 'Unsafe Condition';
-  const sev = normalizeSeverity(body.severity);
   const sw = normalizeStopWork(body.stop_work_authority_used);
   const fu = normalizeFollowUp(body.followup_status);
   return {
@@ -126,7 +117,6 @@ function normalizePayload(rawBody) {
     contractor_observed: clean(body.contractor_observed) || 'None',
     type_of_observation: obs,
     type_of_hazard: clean(body.type_of_hazard) || FIELD_DEFAULTS.type_of_hazard,
-    severity: sev,
     positive_safe_observation: clean(body.positive_safe_observation),
     stop_work_authority_used: sw,
     description_of_event: clean(body.description_of_event),
@@ -138,7 +128,6 @@ function normalizePayload(rawBody) {
     photo_content_type: clean(body.photo_content_type) || 'image/jpeg',
     selected_values: {
       type_of_observation: TYPE_OF_OBSERVATION_LABELS[obs],
-      severity: SEVERITY_LABELS[sev],
       stop_work_authority_used: STOP_WORK_LABELS[sw],
       followup_status: FOLLOW_UP_LABELS[fu],
     },
@@ -353,12 +342,6 @@ async function chooseRadio(page, groupLabel, optionLabel) {
   return optionLabel;
 }
 
-async function chooseComboOrRadio(page, label, value) {
-  if (!value) return '';
-  try { return await chooseCombo(page, label, value); }
-  catch (e) { console.warn(`[${label}] combo failed:`, e.message); return chooseRadio(page, label, value); }
-}
-
 async function checkCheckboxIfPresent(page, label) {
   try {
     // Try multiple selectors for the confirmation checkbox
@@ -463,13 +446,12 @@ function stageTimeout(name) {
   if (name === 'wait Airtable network idle') return 25000;
   if (name === 'wait Airtable form ready') return FORM_READY_TIMEOUT_MS + 5000;
   if (name === 'wait for form inputs') return FORM_READY_TIMEOUT_MS + 5000;
-  if (name === 'wait for severity field') return 8000;
   if (name === 'fill date') return 9000;
   if (name === 'fill time') return 7000;
   if (name === 'choose project site' || name === 'choose contractor observed') return 60000;
   if (name === 'fill company') return 20000;
   if (name === 'choose type of observation' || name === 'choose stop work authority' || name === 'choose follow-up status') return 20000;
-  if (name === 'choose severity' || name === 'choose type of hazard' || name === 'choose positive/safe observation') return 20000;
+  if (name === 'choose type of hazard' || name === 'choose positive/safe observation') return 20000;
   if (name === 'submit form') return 18000;
   if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
   return ACTION_TIMEOUT_MS + 5000;
@@ -575,8 +557,8 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       })
     );
 
-    // INCREASED WAIT: Allow conditional fields (severity, hazard type, etc.) to appear
-    await page.waitForTimeout(2000);
+    // Wait for conditional fields to appear
+    await page.waitForTimeout(1500);
 
     if (payload.type_of_observation === 'Positive/Safe Observation' && payload.positive_safe_observation && !payload.positive_safe_observation.includes('.')) {
       selected.positive_safe_observation = await stageIfVisible(stage, 'choose positive/safe observation', 'Positive/Safe Observation', page,
@@ -605,33 +587,9 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       selected.type_of_hazard = '';
     }
 
-    // IMPROVED SEVERITY HANDLING: Wait for field to appear, then scroll and select
-    await stage('wait for severity field', async () => {
-      const deadline = Date.now() + 6000;
-      while (Date.now() < deadline) {
-        if (await isFieldVisible(page, 'Severity', 1000)) {
-          console.log('[wait for severity field] field is now visible');
-          await page.waitForTimeout(500);
-          return;
-        }
-        await page.waitForTimeout(500);
-      }
-      console.warn('[wait for severity field] timeout, proceeding anyway');
-    });
-
-    selected.severity = await stage('choose severity', async () => {
-      // Scroll to ensure field is in viewport
-      await page.evaluate(() => window.scrollBy(0, 300));
-      await page.waitForTimeout(500);
-      
-      return withFB({
-        fieldName: 'severity',
-        value: SEVERITY_LABELS[payload.severity],
-        defaultValue: SEVERITY_LABELS[FIELD_DEFAULTS.severity],
-        primaryFn: () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[payload.severity]),
-        fallbackFn: () => chooseComboOrRadio(page, 'Severity', SEVERITY_LABELS[FIELD_DEFAULTS.severity]),
-      });
-    });
+    // SEVERITY REMOVED - Not required and causing issues
+    console.log('[severity] skipping severity field (not required)');
+    selected.severity = null;
 
     selected.confirmation_checked = await stage('check confirmation', () => checkCheckboxIfPresent(page, 'Please check this box'));
 
@@ -828,10 +786,10 @@ async function submitObservationForm(req, res) {
 
 app.get('/', (req, res) => res.json({
   ok: true, service: 'AI Safety Manager Form Service',
-  submit_mode: SUBMIT_MODE, version: 'v23-severity-fix',
+  submit_mode: SUBMIT_MODE, version: 'v24-no-severity',
   endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
 }));
-app.get('/health', (req, res) => res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v23-severity-fix' }));
+app.get('/health', (req, res) => res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v24-no-severity' }));
 app.post('/', submitObservationForm);
 app.post('/submit-observation-form', submitObservationForm);
 
