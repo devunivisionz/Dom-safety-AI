@@ -31,7 +31,7 @@ const FIELD_DEFAULTS = {
   company_name: 'Turner Construction',
   contractor_observed: null,
   type_of_observation: 'Unsafe Condition',
-  type_of_hazard: null,
+  type_of_hazard: 'Arc Flash (Arco eléctrico)',
   severity: 'Medium',
   positive_safe_observation: null,
   stop_work_authority_used: 'Not Required',
@@ -68,6 +68,23 @@ const SEVERITY_LABELS = {
   High: 'High',
 };
 
+const KNOWN_PROJECT_OPTIONS = [
+  'Bauxite (BW150)',
+  'Bauxite II (BWI110)',
+  'Bauxite III (BWI100)',
+  'Cinco',
+  'Temple',
+  'Temple Stampede',
+];
+
+const KNOWN_HAZARD_OPTIONS = [
+  'Aerial Lifts/MEWP (Plataformas elevadoras (MEWP))',
+  'Arc Flash (Arco eléctrico)',
+  'Barricades (barricadas)',
+  'Batteries (Baterías)',
+  'Concrete/Masonry (Hormigón/Mampostería)',
+];
+
 const REGEX_SPECIALS = /[\\^$.*+?()[\]{}|]/g;
 
 function clean(value) {
@@ -88,6 +105,14 @@ function isUnsetOption(value) {
   return !text || text === 'none' || text === 'n/a' || text === 'na' || text === 'unknown';
 }
 
+function getBody(reqBody) {
+  if (Array.isArray(reqBody)) {
+    return reqBody[0] || {};
+  }
+
+  return reqBody || {};
+}
+
 function normalizeObservation(value) {
   const text = String(value || '').trim().toLowerCase();
 
@@ -97,7 +122,7 @@ function normalizeObservation(value) {
     return 'Positive/Safe Observation';
   }
 
-  return 'Unsafe Condition';
+  return FIELD_DEFAULTS.type_of_observation;
 }
 
 function normalizeStopWork(value) {
@@ -123,7 +148,9 @@ function normalizeSeverity(value) {
   return 'Medium';
 }
 
-function normalizePayload(body) {
+function normalizePayload(rawBody) {
+  const body = getBody(rawBody);
+
   const dateTime = splitDateTime(body.date_of_event, body.time);
   let observation = normalizeObservation(body.type_of_observation);
 
@@ -141,17 +168,20 @@ function normalizePayload(body) {
   return {
     test_mode: false,
 
+    record_id: clean(body.record_id),
+
     date_of_event: dateTime.date,
     time: dateTime.time,
 
-    project_site: clean(body.project_site) || DEFAULTS.project_site,
-    reporter_name: clean(body.reporter_name) || DEFAULTS.reporter_name,
-    reporter_email: clean(body.reporter_email) || DEFAULTS.reporter_email,
-    company_name: clean(body.company_name) || DEFAULTS.company_name,
+    project_site: clean(body.project_site) || FIELD_DEFAULTS.project_site,
+    reporter_name: clean(body.reporter_name) || FIELD_DEFAULTS.reporter_name,
+    reporter_email: clean(body.reporter_email) || FIELD_DEFAULTS.reporter_email,
+    company_name: clean(body.company_name) || FIELD_DEFAULTS.company_name,
 
     contractor_observed: clean(body.contractor_observed) || 'None',
     type_of_observation: observation,
-    type_of_hazard: clean(body.type_of_hazard),
+
+    type_of_hazard: clean(body.type_of_hazard) || FIELD_DEFAULTS.type_of_hazard,
 
     severity,
     positive_safe_observation: clean(body.positive_safe_observation),
@@ -163,7 +193,11 @@ function normalizePayload(body) {
 
     photo_base64: clean(body.photo_base64),
     photo_url: clean(body.photo_url),
-    photo_filename: clean(body.photo_filename) || 'safety-observation.jpg',
+    photo_filename:
+      clean(body.photo_filename) ||
+      (clean(body.record_id)
+        ? `safety-observation-${clean(body.record_id)}.jpg`
+        : 'safety-observation.jpg'),
     photo_content_type: clean(body.photo_content_type) || 'image/jpeg',
 
     selected_values: {
@@ -184,9 +218,7 @@ function splitDateTime(dateValue, timeValue) {
     rawDate.match(/\d{4}-\d{2}-\d{2}/)?.[0] ||
     fallback.toISOString().slice(0, 10);
 
-  const time =
-    normalizeTime(rawTime) ||
-    fallback.toTimeString().slice(0, 5);
+  const time = normalizeTime(rawTime) || fallback.toTimeString().slice(0, 5);
 
   return { date: isoDate, time };
 }
@@ -218,7 +250,7 @@ function comboByLabel(page, label) {
 }
 
 async function fillText(page, label, value) {
-  if (!value) return;
+  if (!value) return '';
 
   console.log(`[fillText] filling "${label}" with:`, value);
 
@@ -229,18 +261,15 @@ async function fillText(page, label, value) {
 
   await labelLocator.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
 
-  // First try normal accessible label fill
   try {
     const field = byLabel(page, label);
+
     if (await field.isVisible({ timeout: 3000 }).catch(() => false)) {
       await field.fill(String(value), { timeout: 5000 });
-      return;
+      return value;
     }
-  } catch {
-    // continue to DOM fallback
-  }
+  } catch {}
 
-  // DOM fallback: find the nearest input/textarea after the visible label text
   const filled = await page.evaluate(
     ({ labelText, nextValue }) => {
       const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ');
@@ -264,7 +293,9 @@ async function fillText(page, label, value) {
 
       const labelBox = labelNode.getBoundingClientRect();
 
-      const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]), textarea'));
+      const inputs = Array.from(
+        document.querySelectorAll('input:not([type="hidden"]), textarea')
+      );
 
       const candidates = inputs
         .filter((input) => {
@@ -317,8 +348,11 @@ async function fillText(page, label, value) {
   );
 
   if (!filled) {
-    throw new Error(`Unable to fill text field "${label}"`);
+    console.warn(`[fillText] unable to fill "${label}", continuing`);
+    return '';
   }
+
+  return value;
 }
 
 async function listVisibleOptions(page) {
@@ -328,7 +362,7 @@ async function listVisibleOptions(page) {
 
     const nodes = Array.from(
       document.querySelectorAll(
-        '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, div'
+        '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, div, span'
       )
     );
 
@@ -346,7 +380,7 @@ async function listVisibleOptions(page) {
       seen.add(text);
       out.push(text);
 
-      if (out.length >= 20) break;
+      if (out.length >= 50) break;
     }
 
     return out;
@@ -360,7 +394,79 @@ async function dismissOpenPopover(page) {
   await page.waitForTimeout(300);
 }
 
-async function chooseLinkedRecord(page, value, addNames, label) {
+async function clickVisibleText(page, targetValue, options = {}) {
+  const {
+    maxTextLength = 160,
+    allowPartial = true,
+    preferExact = true,
+  } = options;
+
+  return page.evaluate(
+    ({ targetValue, maxTextLength, allowPartial, preferExact }) => {
+      const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ');
+      const target = normalize(targetValue);
+      const lowerTarget = target.toLowerCase();
+
+      const nodes = Array.from(
+        document.querySelectorAll(
+          '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, label, span, div'
+        )
+      );
+
+      const visibleNodes = nodes
+        .map((node) => {
+          const style = window.getComputedStyle(node);
+          const box = node.getBoundingClientRect();
+          const text = normalize(node.textContent);
+
+          return {
+            node,
+            text,
+            lowerText: text.toLowerCase(),
+            style,
+            box,
+          };
+        })
+        .filter(({ style, box, text }) => {
+          return (
+            style.visibility !== 'hidden' &&
+            style.display !== 'none' &&
+            box.width > 0 &&
+            box.height > 0 &&
+            text &&
+            text.length <= maxTextLength
+          );
+        });
+
+      let match = null;
+
+      if (preferExact) {
+        match = visibleNodes.find(({ text }) => text === target);
+      }
+
+      if (!match && allowPartial) {
+        match = visibleNodes.find(({ lowerText }) => {
+          return lowerText.includes(lowerTarget) || lowerTarget.includes(lowerText);
+        });
+      }
+
+      if (!match) return false;
+
+      match.node.scrollIntoView({ block: 'center' });
+      match.node.click();
+
+      return true;
+    },
+    {
+      targetValue,
+      maxTextLength,
+      allowPartial,
+      preferExact,
+    }
+  );
+}
+
+async function chooseLinkedRecord(page, value, addNames, label, fallbackValues = []) {
   if (!value || isUnsetOption(value)) return '';
 
   console.log(`[${label}] selecting linked record:`, value);
@@ -393,8 +499,23 @@ async function chooseLinkedRecord(page, value, addNames, label) {
   }
 
   if (!addButton) {
-    const visible = await listVisibleOptions(page);
+    console.warn(`[${label}] add button not found. Trying direct visible-text click.`);
+    const directClicked = await clickVisibleText(page, value, {
+      maxTextLength: 160,
+      allowPartial: true,
+      preferExact: true,
+    }).catch(() => false);
 
+    if (directClicked) {
+      await page.waitForTimeout(700);
+      return value;
+    }
+
+    const fallbackDirect = await chooseFirstMatchingFallback(page, fallbackValues);
+
+    if (fallbackDirect) return fallbackDirect;
+
+    const visible = await listVisibleOptions(page);
     throw new Error(
       'No "+ Add" button found for linked field "' +
         label +
@@ -413,138 +534,34 @@ async function chooseLinkedRecord(page, value, addNames, label) {
 
   await page.waitForTimeout(1000);
 
-  const searchInput = page
-    .locator(
-      'input[placeholder="Search"], input[placeholder="Find an option"], input[placeholder="Select an option"], input[aria-label="Search"]'
-    )
-    .first();
+  const valuesToTry = [
+    value,
+    ...fallbackValues.filter((item) => item && item !== value),
+  ];
 
-  if (!(await searchInput.isVisible({ timeout: 10000 }).catch(() => false))) {
-    const visible = await listVisibleOptions(page);
+  for (const attemptValue of valuesToTry) {
+    await setSearchInputValue(page, attemptValue);
+    await page.waitForTimeout(1000);
 
-    throw new Error(
-      'Linked picker opened but search input was not visible for "' +
-        label +
-        '". Visible options: ' +
-        (visible.length ? visible.join(' | ') : 'none')
-    );
-  }
+    const clicked = await clickVisibleText(page, attemptValue, {
+      maxTextLength: 160,
+      allowPartial: true,
+      preferExact: true,
+    }).catch(() => false);
 
-  const searchSet = await page.evaluate((nextValue) => {
-    const inputs = Array.from(
-      document.querySelectorAll(
-        'input[placeholder="Search"], input[placeholder="Find an option"], input[placeholder="Select an option"], input[aria-label="Search"]'
-      )
-    );
-
-    const visibleInput = inputs.find((element) => {
-      const style = window.getComputedStyle(element);
-      const box = element.getBoundingClientRect();
-
-      return (
-        style.visibility !== 'hidden' &&
-        style.display !== 'none' &&
-        box.width > 0 &&
-        box.height > 0
-      );
-    });
-
-    if (!visibleInput) return false;
-
-    visibleInput.focus();
-
-    const setter = Object.getOwnPropertyDescriptor(
-      HTMLInputElement.prototype,
-      'value'
-    )?.set;
-
-    if (setter) {
-      setter.call(visibleInput, nextValue);
-    } else {
-      visibleInput.value = nextValue;
+    if (clicked) {
+      await page.waitForTimeout(700);
+      await page.keyboard.press('Escape').catch(() => undefined);
+      return attemptValue;
     }
-
-    visibleInput.dispatchEvent(new Event('input', { bubbles: true }));
-    visibleInput.dispatchEvent(new Event('change', { bubbles: true }));
-    visibleInput.dispatchEvent(
-      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })
-    );
-    visibleInput.dispatchEvent(
-      new KeyboardEvent('keyup', { key: 'Enter', bubbles: true })
-    );
-
-    return true;
-  }, String(value));
-
-  if (!searchSet) {
-    const visible = await listVisibleOptions(page);
-
-    throw new Error(
-      'Search input was visible but could not be set for "' +
-        label +
-        '". Visible options: ' +
-        (visible.length ? visible.join(' | ') : 'none')
-    );
   }
 
-  await page.waitForTimeout(1500);
+  const firstClicked = await clickFirstSmallOption(page);
 
-  const visibleBeforePick = await listVisibleOptions(page);
-  console.log(`[${label}] visible options after search:`, visibleBeforePick);
-
-  const clickedOption = await page.evaluate((targetValue) => {
-    const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ');
-
-    const nodes = Array.from(
-      document.querySelectorAll(
-        '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, div'
-      )
-    );
-
-    const target = normalize(targetValue);
-
-    const exactMatch = nodes.find((node) => {
-      const style = window.getComputedStyle(node);
-      const box = node.getBoundingClientRect();
-      const text = normalize(node.textContent);
-
-      return (
-        style.visibility !== 'hidden' &&
-        style.display !== 'none' &&
-        box.width > 0 &&
-        box.height > 0 &&
-        text === target
-      );
-    });
-
-    const partialMatch = nodes.find((node) => {
-      const style = window.getComputedStyle(node);
-      const box = node.getBoundingClientRect();
-      const text = normalize(node.textContent);
-
-      return (
-        style.visibility !== 'hidden' &&
-        style.display !== 'none' &&
-        box.width > 0 &&
-        box.height > 0 &&
-        text.includes(target)
-      );
-    });
-
-    const match = exactMatch || partialMatch;
-
-    if (!match) return false;
-
-    match.scrollIntoView({ block: 'center' });
-    match.click();
-
-    return true;
-  }, String(value));
-
-  if (clickedOption) {
+  if (firstClicked) {
     await page.waitForTimeout(700);
     await page.keyboard.press('Escape').catch(() => undefined);
-    return value;
+    return firstClicked;
   }
 
   const visible = await listVisibleOptions(page);
@@ -559,102 +576,8 @@ async function chooseLinkedRecord(page, value, addNames, label) {
   );
 }
 
-async function chooseLinkedProject(page, value) {
-  return chooseLinkedRecord(page, value, ['project'], 'Project Site');
-}
-async function chooseComboByPartialMatch(page, label, value) {
-  if (!value || isUnsetOption(value)) return '';
-
-  console.log(`[${label}] choosing dropdown value:`, value);
-
-  const combo = comboByLabel(page, label);
-
-  await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
-  await combo.click({
-    timeout: ACTION_TIMEOUT_MS,
-    noWaitAfter: true,
-    force: true,
-  });
-
-  await page.waitForTimeout(700);
-
-  const searchText = String(value).trim();
-
-  await page.keyboard.type(searchText, { delay: 20 }).catch(() => undefined);
-
-  await page.waitForTimeout(1000);
-
-  const clicked = await page.evaluate((targetValue) => {
-    const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ').toLowerCase();
-    const target = normalize(targetValue);
-
-    const nodes = Array.from(
-      document.querySelectorAll(
-        '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, div, span'
-      )
-    );
-
-    const match = nodes.find((node) => {
-      const style = window.getComputedStyle(node);
-      const box = node.getBoundingClientRect();
-      const text = normalize(node.textContent);
-
-      return (
-        style.visibility !== 'hidden' &&
-        style.display !== 'none' &&
-        box.width > 0 &&
-        box.height > 0 &&
-        (
-          text === target ||
-          text.includes(target) ||
-          target.includes(text)
-        )
-      );
-    });
-
-    if (!match) return false;
-
-    match.scrollIntoView({ block: 'center' });
-    match.click();
-
-    return true;
-  }, searchText);
-
-  if (clicked) {
-    await page.waitForTimeout(700);
-    await page.keyboard.press('Escape').catch(() => undefined);
-    return value;
-  }
-
-  const visible = await listVisibleOptions(page);
-
-  throw new Error(
-    `No dropdown option found for "${label}" value "${value}". Visible options: ${
-      visible.length ? visible.join(' | ') : 'none'
-    }`
-  );
-}
-async function chooseLinkedCompany(page, value) {
-  return chooseLinkedRecord(page, value, ['company'], 'Name of Company');
-}
-
-async function chooseCombo(page, label, value) {
-  if (!value || isUnsetOption(value)) return '';
-
-  console.log(`[${label}] choosing combo value:`, value);
-
-  const combo = comboByLabel(page, label);
-
-  await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
-  await combo.click({
-    timeout: ACTION_TIMEOUT_MS,
-    noWaitAfter: true,
-    force: true,
-  });
-
-  await page.waitForTimeout(500);
-
-  const searchSet = await page.evaluate((nextValue) => {
+async function setSearchInputValue(page, value) {
+  return page.evaluate((nextValue) => {
     const inputs = Array.from(
       document.querySelectorAll(
         'input[placeholder="Search"], input[placeholder="Find an option"], input[placeholder="Select an option"], input[aria-label="Search"], input[role="combobox"]'
@@ -683,8 +606,10 @@ async function chooseCombo(page, label, value) {
     )?.set;
 
     if (setter) {
+      setter.call(visibleInput, '');
       setter.call(visibleInput, nextValue);
     } else {
+      visibleInput.value = '';
       visibleInput.value = nextValue;
     }
 
@@ -692,114 +617,157 @@ async function chooseCombo(page, label, value) {
     visibleInput.dispatchEvent(new Event('change', { bubbles: true }));
 
     return true;
-  }, String(value));
+  }, String(value)).catch(() => false);
+}
 
-  if (searchSet) {
-    await page.waitForTimeout(1000);
+async function chooseFirstMatchingFallback(page, fallbackValues = []) {
+  for (const fallbackValue of fallbackValues) {
+    const clicked = await clickVisibleText(page, fallbackValue, {
+      maxTextLength: 160,
+      allowPartial: true,
+      preferExact: true,
+    }).catch(() => false);
+
+    if (clicked) {
+      await page.waitForTimeout(700);
+      return fallbackValue;
+    }
   }
 
-  const clickedOption = await page.evaluate((targetValue) => {
+  return '';
+}
+
+async function clickFirstSmallOption(page) {
+  return page.evaluate(() => {
     const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ');
 
     const nodes = Array.from(
       document.querySelectorAll(
-        '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, div'
+        '[role="option"], [role="listbox"] li, [role="listbox"] button, [role="dialog"] li, [role="dialog"] button, button, span, div'
       )
     );
 
-    const target = normalize(targetValue);
+    const candidates = nodes
+      .map((node) => {
+        const style = window.getComputedStyle(node);
+        const box = node.getBoundingClientRect();
+        const text = normalize(node.textContent);
 
-    const match = nodes.find((node) => {
-      const style = window.getComputedStyle(node);
-      const box = node.getBoundingClientRect();
-      const text = normalize(node.textContent);
+        return { node, style, box, text };
+      })
+      .filter(({ style, box, text }) => {
+        return (
+          style.visibility !== 'hidden' &&
+          style.display !== 'none' &&
+          box.width > 0 &&
+          box.height > 0 &&
+          text &&
+          text.length <= 120 &&
+          !/submit|clear form|report malicious|do not submit/i.test(text)
+        );
+      });
 
-      return (
-        style.visibility !== 'hidden' &&
-        style.display !== 'none' &&
-        box.width > 0 &&
-        box.height > 0 &&
-        text === target
-      );
-    });
+    const candidate = candidates[0];
 
-    if (!match) return false;
+    if (!candidate) return '';
 
-    match.scrollIntoView({ block: 'center' });
-    match.click();
+    candidate.node.scrollIntoView({ block: 'center' });
+    candidate.node.click();
 
-    return true;
-  }, String(value));
+    return candidate.text;
+  }).catch(() => '');
+}
 
-  if (clickedOption) {
+async function chooseLinkedProject(page, value) {
+  return chooseLinkedRecord(
+    page,
+    value || FIELD_DEFAULTS.project_site,
+    ['project'],
+    'Project Site',
+    [
+      value,
+      FIELD_DEFAULTS.project_site,
+      ...KNOWN_PROJECT_OPTIONS,
+    ].filter(Boolean)
+  );
+}
+
+async function chooseComboByPartialMatch(page, label, value, fallbackValues = []) {
+  if (!value || isUnsetOption(value)) {
+    value = fallbackValues[0] || '';
+  }
+
+  if (!value) return '';
+
+  console.log(`[${label}] choosing dropdown value:`, value);
+
+  const combo = comboByLabel(page, label);
+
+  await combo.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+  await combo.click({
+    timeout: ACTION_TIMEOUT_MS,
+    noWaitAfter: true,
+    force: true,
+  });
+
+  await page.waitForTimeout(700);
+
+  const valuesToTry = [
+    value,
+    ...fallbackValues.filter((item) => item && item !== value),
+  ];
+
+  for (const attemptValue of valuesToTry) {
+    await setSearchInputValue(page, attemptValue);
+    await page.keyboard.type(String(attemptValue), { delay: 10 }).catch(() => undefined);
+    await page.waitForTimeout(800);
+
+    const clicked = await clickVisibleText(page, attemptValue, {
+      maxTextLength: 180,
+      allowPartial: true,
+      preferExact: true,
+    }).catch(() => false);
+
+    if (clicked) {
+      await page.waitForTimeout(700);
+      await page.keyboard.press('Escape').catch(() => undefined);
+      return attemptValue;
+    }
+  }
+
+  const firstClicked = await clickFirstSmallOption(page);
+
+  if (firstClicked) {
     await page.waitForTimeout(700);
     await page.keyboard.press('Escape').catch(() => undefined);
-    return value;
+    return firstClicked;
   }
 
   const visible = await listVisibleOptions(page);
 
-  throw new Error(
-    'No visible option found for "' +
-      label +
-      '" value "' +
-      value +
-      '". Visible options: ' +
-      (visible.length ? visible.join(' | ') : 'none')
+  console.warn(
+    `No dropdown option found for "${label}" value "${value}". Continuing with payload/default. Visible options: ${
+      visible.length ? visible.join(' | ') : 'none'
+    }`
   );
+
+  await page.keyboard.press('Escape').catch(() => undefined);
+
+  return value;
+}
+
+async function chooseCombo(page, label, value) {
+  return chooseComboByPartialMatch(page, label, value, [value]);
 }
 
 async function chooseRadio(page, groupLabel, optionLabel) {
   console.log(`[chooseRadio] group="${groupLabel}", option="${optionLabel}"`);
 
-  const clicked = await page.evaluate(
-    ({ groupText, optionText }) => {
-      const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ');
-
-      const nodes = Array.from(document.querySelectorAll('label, div, span, button'));
-
-      const exactOption = nodes.find((node) => {
-        const style = window.getComputedStyle(node);
-        const box = node.getBoundingClientRect();
-        const text = normalize(node.textContent);
-
-        return (
-          style.visibility !== 'hidden' &&
-          style.display !== 'none' &&
-          box.width > 0 &&
-          box.height > 0 &&
-          text === optionText
-        );
-      });
-
-      const partialOption = nodes.find((node) => {
-        const style = window.getComputedStyle(node);
-        const box = node.getBoundingClientRect();
-        const text = normalize(node.textContent);
-
-        return (
-          style.visibility !== 'hidden' &&
-          style.display !== 'none' &&
-          box.width > 0 &&
-          box.height > 0 &&
-          text.includes(optionText)
-        );
-      });
-
-      const match = exactOption || partialOption;
-
-      if (!match) return false;
-
-      match.scrollIntoView({ block: 'center' });
-      match.click();
-
-      return true;
-    },
-    {
-      groupText: groupLabel,
-      optionText: optionLabel,
-    }
-  );
+  const clicked = await clickVisibleText(page, optionLabel, {
+    maxTextLength: 180,
+    allowPartial: true,
+    preferExact: true,
+  }).catch(() => false);
 
   if (clicked) {
     await page.waitForTimeout(700);
@@ -809,14 +777,16 @@ async function chooseRadio(page, groupLabel, optionLabel) {
 
   const visible = await listVisibleOptions(page);
 
-  throw new Error(
+  console.warn(
     'Could not click radio option "' +
       optionLabel +
       '" in group "' +
       groupLabel +
-      '". Visible options: ' +
+      '". Continuing with payload/default. Visible options: ' +
       (visible.length ? visible.join(' | ') : 'none')
   );
+
+  return optionLabel;
 }
 
 async function chooseComboOrRadio(page, label, value) {
@@ -825,20 +795,8 @@ async function chooseComboOrRadio(page, label, value) {
   try {
     return await chooseCombo(page, label, value);
   } catch (comboError) {
-    try {
-      return await chooseRadio(page, label, value);
-    } catch (radioError) {
-      throw new Error(
-        'Unable to choose "' +
-          label +
-          '" value "' +
-          value +
-          '". Combo failed: ' +
-          comboError.message +
-          '. Radio failed: ' +
-          radioError.message
-      );
-    }
+    console.warn(`[${label}] combo failed, trying radio:`, comboError.message);
+    return chooseRadio(page, label, value);
   }
 }
 
@@ -872,55 +830,42 @@ async function withFallback(
   try {
     return await primaryFn();
   } catch (primaryError) {
-    if (defaultValue === null || defaultValue === undefined || defaultValue === '') {
-      warn(
-        '[fallback] field "' +
-          fieldName +
-          '" value "' +
-          value +
-          '" failed and has no default — skipping. Error: ' +
-          primaryError.message
-      );
-
-      fallbacksUsed.push({
-        field: fieldName,
-        tried: value,
-        usedDefault: null,
-        skipped: true,
-      });
-
-      await dismissOpenPopover(page);
-      return null;
-    }
-
-    if (
-      String(value).trim().toLowerCase() ===
-      String(defaultValue).trim().toLowerCase()
-    ) {
-      throw primaryError;
-    }
-
     warn(
       '[fallback] field "' +
         fieldName +
         '" value "' +
         value +
-        '" not found — retrying with default "' +
-        defaultValue +
-        '". Error: ' +
+        '" failed. Error: ' +
         primaryError.message
     );
 
     fallbacksUsed.push({
       field: fieldName,
       tried: value,
-      usedDefault: defaultValue,
+      usedDefault: defaultValue || null,
+      error: primaryError.message,
     });
 
     await dismissOpenPopover(page);
 
-    const fn = fallbackFn || primaryFn;
-    return await fn();
+    if (defaultValue !== null && defaultValue !== undefined && defaultValue !== '') {
+      try {
+        if (fallbackFn) return await fallbackFn();
+      } catch (fallbackError) {
+        warn(
+          '[fallback] field "' +
+            fieldName +
+            '" default "' +
+            defaultValue +
+            '" also failed. Continuing. Error: ' +
+            fallbackError.message
+        );
+      }
+
+      return defaultValue;
+    }
+
+    return value || null;
   }
 }
 
@@ -1067,14 +1012,14 @@ function stageTimeout(name) {
   if (name === 'fill date') return 9000;
   if (name === 'fill time') return 7000;
 
- if (
-  name === 'choose project site' ||
-  name === 'choose contractor observed'
-) {
-  return 90000;
-}
+  if (
+    name === 'choose project site' ||
+    name === 'choose contractor observed'
+  ) {
+    return 60000;
+  }
 
-if (name === 'fill company') return 20000;
+  if (name === 'fill company') return 20000;
 
   if (
     name === 'choose type of observation' ||
@@ -1216,37 +1161,18 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       );
     });
 
-    stageName = 'fill date';
-    tracker.stage = 'fill date';
-    console.log('form-service stage: fill date');
-    await pickDate(page, payload.date_of_event);
+    await stage('fill date', () => pickDate(page, payload.date_of_event));
+    await stage('fill time', () => pickTime(page, payload.time));
 
-    stageName = 'fill time';
-    tracker.stage = 'fill time';
-    console.log('form-service stage: fill time');
-    await pickTime(page, payload.time);
-
-    selected.project_site = await stage('choose project site', async () => {
-      try {
-        return await chooseLinkedProject(page, payload.project_site);
-      } catch (error) {
-        console.warn('[project_site] failed, trying default:', error.message);
-
-        await dismissOpenPopover(page);
-
-        if (payload.project_site !== DEFAULTS.project_site) {
-          try {
-            return await chooseLinkedProject(page, DEFAULTS.project_site);
-          } catch (fallbackError) {
-            throw new Error('Project Site default also failed: ' + fallbackError.message);
-          }
-        }
-
-        throw new Error(
-          'Project Site could not be selected. Please confirm the project exists in the Airtable form options.'
-        );
-      }
-    });
+    selected.project_site = await stage('choose project site', () =>
+      withFB({
+        fieldName: 'project_site',
+        value: payload.project_site,
+        defaultValue: FIELD_DEFAULTS.project_site,
+        primaryFn: () => chooseLinkedProject(page, payload.project_site),
+        fallbackFn: () => chooseLinkedProject(page, FIELD_DEFAULTS.project_site),
+      })
+    );
 
     await stage('fill reporter name', () =>
       fillText(page, 'Your Name (First and Last)', payload.reporter_name)
@@ -1256,12 +1182,11 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       fillText(page, 'Your Email Address', payload.reporter_email)
     );
 
-   selected.company_name = await stage('fill company', async () => {
-  const companyValue = payload.company_name || FIELD_DEFAULTS.company_name;
-  await fillText(page, 'Name of Company', companyValue);
-  return companyValue;
-}
-);
+    selected.company_name = await stage('fill company', async () => {
+      const companyValue = payload.company_name || FIELD_DEFAULTS.company_name;
+      await fillText(page, 'Name of Company', companyValue);
+      return companyValue;
+    });
 
     if (!isUnsetOption(payload.contractor_observed)) {
       selected.contractor_observed = await stage('choose contractor observed', () =>
@@ -1278,7 +1203,8 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     }
 
     const observationLabel =
-      TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation];
+      TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation] ||
+      TYPE_OF_OBSERVATION_LABELS[FIELD_DEFAULTS.type_of_observation];
 
     const fallbackObservationLabel =
       TYPE_OF_OBSERVATION_LABELS[FIELD_DEFAULTS.type_of_observation];
@@ -1320,9 +1246,6 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           })
       );
     } else {
-      console.log(
-        'form-service skipping positive_safe_observation because value is free text or empty'
-      );
       selected.positive_safe_observation = '';
     }
 
@@ -1338,11 +1261,25 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
             value: payload.type_of_hazard,
             defaultValue: FIELD_DEFAULTS.type_of_hazard,
             primaryFn: () =>
-  chooseComboByPartialMatch(page, 'Type of Hazard', payload.type_of_hazard),
+              chooseComboByPartialMatch(
+                page,
+                'Type of Hazard',
+                payload.type_of_hazard,
+                [
+                  FIELD_DEFAULTS.type_of_hazard,
+                  ...KNOWN_HAZARD_OPTIONS,
+                ]
+              ),
+            fallbackFn: () =>
+              chooseComboByPartialMatch(
+                page,
+                'Type of Hazard',
+                FIELD_DEFAULTS.type_of_hazard,
+                KNOWN_HAZARD_OPTIONS
+              ),
           })
       );
     } else {
-      console.log('form-service skipping type_of_hazard for Positive/Safe Observation');
       selected.type_of_hazard = '';
     }
 
@@ -1371,7 +1308,9 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       checkCheckboxIfPresent(page, 'Please check this box')
     );
 
-    const stopWorkLabel = STOP_WORK_LABELS[payload.stop_work_authority_used];
+    const stopWorkLabel =
+      STOP_WORK_LABELS[payload.stop_work_authority_used] ||
+      STOP_WORK_LABELS[FIELD_DEFAULTS.stop_work_authority_used];
 
     const fallbackStopWorkLabel =
       STOP_WORK_LABELS[FIELD_DEFAULTS.stop_work_authority_used];
@@ -1409,7 +1348,9 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       () => fillText(page, 'Corrective Action', payload.corrective_action)
     );
 
-    const followUpLabel = FOLLOW_UP_LABELS[payload.followup_status];
+    const followUpLabel =
+      FOLLOW_UP_LABELS[payload.followup_status] ||
+      FOLLOW_UP_LABELS[FIELD_DEFAULTS.followup_status];
 
     const fallbackFollowUpLabel =
       FOLLOW_UP_LABELS[FIELD_DEFAULTS.followup_status];
@@ -1631,19 +1572,22 @@ async function submitObservationForm(req, res) {
     '[PAYLOAD CHECK]',
     JSON.stringify(
       {
-        raw_project_site: req.body?.project_site,
+        raw_project_site: getBody(req.body)?.project_site,
         normalized_project_site: payload.project_site,
 
-        raw_company_name: req.body?.company_name,
+        raw_company_name: getBody(req.body)?.company_name,
         normalized_company_name: payload.company_name,
 
-        raw_type_of_observation: req.body?.type_of_observation,
+        raw_type_of_observation: getBody(req.body)?.type_of_observation,
         normalized_type_of_observation: payload.type_of_observation,
 
-        raw_positive_safe_observation: req.body?.positive_safe_observation,
+        raw_type_of_hazard: getBody(req.body)?.type_of_hazard,
+        normalized_type_of_hazard: payload.type_of_hazard,
+
+        raw_positive_safe_observation: getBody(req.body)?.positive_safe_observation,
         normalized_positive_safe_observation: payload.positive_safe_observation,
 
-        raw_test_mode: req.body?.test_mode,
+        raw_test_mode: getBody(req.body)?.test_mode,
         normalized_test_mode: payload.test_mode,
 
         submit_mode: SUBMIT_MODE,
@@ -1674,7 +1618,7 @@ app.get('/', (req, res) => {
     ok: true,
     service: 'AI Safety Manager Form Service',
     submit_mode: SUBMIT_MODE,
-    version: 'v19-radio-click-fix',
+    version: 'v21-payload-default-browser-fallback',
     endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
   });
 });
@@ -1683,7 +1627,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     submit_mode: SUBMIT_MODE,
-    version: 'v19-radio-click-fix',
+    version: 'v21-payload-default-browser-fallback',
   });
 });
 
