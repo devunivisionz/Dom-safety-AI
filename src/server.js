@@ -284,38 +284,199 @@ async function chooseLinkedRecord(page, value, addNames, label, fallbackValues =
   if (!value || isUnsetOption(value)) return '';
   console.log(`[${label}] selecting linked record:`, value);
   await dismissOpenPopover(page);
+
   const fieldLabel = page.getByText(label, { exact: true }).or(page.getByText(labelRegex(label))).first();
   await fieldLabel.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
 
+  const addButtonRegexes = addNames.map((an) => new RegExp('\\+?\\s*Add\\s+.*' + escapeRegExp(an), 'i'));
+
   let addButton = null;
-  for (const an of addNames) {
-    const r = new RegExp('\\+?\\s*Add\\s+.*' + escapeRegExp(an), 'i');
+  for (const r of addButtonRegexes) {
     const cand = page.getByRole('button', { name: r }).or(page.getByText(r)).first();
     if (await cand.isVisible({ timeout: 2500 }).catch(() => false)) { addButton = cand; break; }
   }
   if (!addButton) {
-    const dc = await clickVisibleText(page, value, { maxTextLength: 160, allowPartial: true, preferExact: true }).catch(() => false);
-    if (dc) { await page.waitForTimeout(700); return value; }
-    const fd = await chooseFirstMatchingFallback(page, fallbackValues);
-    if (fd) return fd;
-    const v = await listVisibleOptions(page);
-    throw new Error('No "+ Add" button found for linked field "' + label + '". Visible options: ' + (v.length ? v.join(' | ') : 'none'));
+    throw new Error('No "+ Add" button found for linked field "' + label + '"');
   }
-  await addButton.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
-  await addButton.click({ timeout: 5000, noWaitAfter: true, force: true });
-  await page.waitForTimeout(1000);
 
-  const vt = [value, ...fallbackValues.filter((x) => x && x !== value)];
-  for (const av of vt) {
-    await setSearchInputValue(page, av);
-    await page.waitForTimeout(1000);
-    const c = await clickVisibleText(page, av, { maxTextLength: 160, allowPartial: true, preferExact: true }).catch(() => false);
-    if (c) { await page.waitForTimeout(700); await page.keyboard.press('Escape').catch(() => undefined); return av; }
+  // The popover overlays surrounding form content -- it MUST close after
+  // selection or the rest of the form becomes inaccessible. We verify by
+  // checking that the "+ Add" button is gone (Airtable hides it once a
+  // record is linked) AND the search input is no longer visible.
+  const isPickerStillOpen = async () => {
+    const searchVisible = await page.locator(
+      'input[placeholder="Search"], input[placeholder="Find an option"]'
+    ).first().isVisible({ timeout: 300 }).catch(() => false);
+    return searchVisible;
+  };
+
+  const isRecordAttached = async () => {
+    for (const r of addButtonRegexes) {
+      const stillThere = await page.getByRole('button', { name: r })
+        .or(page.getByText(r)).first()
+        .isVisible({ timeout: 400 }).catch(() => false);
+      if (stillThere) return false;
+    }
+    return true;
+  };
+
+  const valuesToTry = [value, ...fallbackValues.filter((x) => x && x !== value)];
+
+  for (const attemptValue of valuesToTry) {
+    console.log(`[${label}] attempting:`, attemptValue);
+
+    // Open the picker if not already open.
+    if (!(await isPickerStillOpen())) {
+      await addButton.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
+      await addButton.click({ timeout: 5000, force: true }).catch(() => undefined);
+      await page.waitForTimeout(800);
+    }
+
+    // Find the actual Search input in the popover and type into it via real
+    // keystrokes. Per screenshot, the popover shows "Search" as the input
+    // placeholder. Typing filters the list of rows shown below.
+    const searchInput = page.locator('input[placeholder="Search"]').first();
+    if (await searchInput.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await searchInput.click({ timeout: 3000 }).catch(() => undefined);
+      // Clear via Ctrl+A + Delete (works even when .fill is rejected).
+      await page.keyboard.press('Control+A').catch(() => undefined);
+      await page.keyboard.press('Delete').catch(() => undefined);
+      await page.keyboard.type(String(attemptValue), { delay: 25 });
+      await page.waitForTimeout(700);
+    }
+
+    // Strategy 1: dispatch a full mouse-event sequence on the matching row
+    // inside the popover. Plain Playwright .click() sometimes fires only
+    // synthetic clicks that React-controlled rows ignore.
+    const dispatched = await page.evaluate((target) => {
+      const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+      const targetNorm = normalize(target);
+      const lt = targetNorm.toLowerCase();
+
+      // Find the popover by locating the Search input first.
+      const searchInputs = Array.from(document.querySelectorAll('input[placeholder="Search"]'));
+      const activeSearch = searchInputs.find((el) => {
+        const s = window.getComputedStyle(el);
+        const b = el.getBoundingClientRect();
+        return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
+      });
+      if (!activeSearch) return { ok: false, reason: 'no_search_input' };
+
+      // Walk up from the search input to find the popover container --
+      // any positioned ancestor.
+      let popover = activeSearch.parentElement;
+      while (popover && popover !== document.body) {
+        const s = window.getComputedStyle(popover);
+        if (s.position === 'absolute' || s.position === 'fixed') break;
+        popover = popover.parentElement;
+      }
+      if (!popover || popover === document.body) {
+        // Fallback: use the search's grandparent.
+        popover = activeSearch.parentElement?.parentElement || activeSearch.parentElement;
+      }
+
+      // Find candidate rows. Per the screenshot they're plain text rows --
+      // we cast a wide net but filter by text length to avoid grabbing
+      // containers.
+      const rows = Array.from(popover.querySelectorAll('button, [role="option"], [role="button"], li, div, span'))
+        .filter((n) => {
+          if (n === activeSearch) return false;
+          const s = window.getComputedStyle(n);
+          const b = n.getBoundingClientRect();
+          if (s.visibility === 'hidden' || s.display === 'none') return false;
+          if (b.width === 0 || b.height === 0) return false;
+          const t = normalize(n.textContent);
+          // Row text should be short -- "Bauxite II (BWI110)" length is ~19.
+          // Cap at 60 to be safe but exclude container divs.
+          return t && t.length > 0 && t.length <= 60;
+        });
+
+      // Prefer the leaf-most element with exact text match (avoids clicking
+      // a wrapper div whose textContent is "Bauxite II (BWI110)Cinco...").
+      let match = rows.find((n) => {
+        const t = normalize(n.textContent);
+        if (t !== targetNorm) return false;
+        // Make sure it's a leaf: no child element with the same text.
+        return !Array.from(n.children).some((c) => normalize(c.textContent) === targetNorm);
+      });
+
+      // Fallback: partial match, leaf-most.
+      if (!match) {
+        match = rows.find((n) => {
+          const t = normalize(n.textContent).toLowerCase();
+          if (!t.includes(lt)) return false;
+          return !Array.from(n.children).some((c) => normalize(c.textContent).toLowerCase().includes(lt));
+        });
+      }
+
+      if (!match) {
+        const sample = rows.slice(0, 10).map((n) => normalize(n.textContent));
+        return { ok: false, reason: 'no_match', sample };
+      }
+
+      match.scrollIntoView({ block: 'center' });
+
+      // Dispatch full mouse-event sequence. React's synthetic event system
+      // listens to these specifically -- pure .click() can miss.
+      const rect = match.getBoundingClientRect();
+      const opts = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2,
+        button: 0,
+      };
+      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+        const Ctor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+        try { match.dispatchEvent(new Ctor(type, opts)); }
+        catch { match.dispatchEvent(new MouseEvent(type === 'pointerdown' ? 'mousedown' : type === 'pointerup' ? 'mouseup' : type, opts)); }
+      });
+      return { ok: true, text: normalize(match.textContent) };
+    }, attemptValue).catch((e) => ({ ok: false, reason: 'evaluate_threw', error: String(e) }));
+
+    console.log(`[${label}] dispatch result:`, JSON.stringify(dispatched));
+
+    if (dispatched?.ok) {
+      await page.waitForTimeout(700);
+      if (await isRecordAttached() && !(await isPickerStillOpen())) {
+        console.log(`[${label}] SELECTED:`, attemptValue);
+        return attemptValue;
+      }
+      // The dispatch fired but the popover didn't close. Try pressing
+      // Escape and re-checking; the record may still have attached.
+      await page.keyboard.press('Escape').catch(() => undefined);
+      await page.waitForTimeout(400);
+      if (await isRecordAttached()) {
+        console.log(`[${label}] SELECTED (after Escape):`, attemptValue);
+        return attemptValue;
+      }
+    }
+
+    // Strategy 2: press Enter (works on React listboxes that pre-highlight
+    // the top result).
+    await page.keyboard.press('Enter').catch(() => undefined);
+    await page.waitForTimeout(500);
+    if (await isRecordAttached() && !(await isPickerStillOpen())) {
+      console.log(`[${label}] SELECTED via Enter:`, attemptValue);
+      return attemptValue;
+    }
+
+    console.warn(`[${label}] attempt failed for "${attemptValue}"`);
+    await page.keyboard.press('Escape').catch(() => undefined);
+    await page.waitForTimeout(400);
   }
-  const fc = await clickFirstSmallOption(page);
-  if (fc) { await page.waitForTimeout(700); await page.keyboard.press('Escape').catch(() => undefined); return fc; }
-  const v = await listVisibleOptions(page);
-  throw new Error('No matching linked option found for "' + label + '" value "' + value + '". Visible options: ' + (v.length ? v.join(' | ') : 'none'));
+
+  const visible = await listVisibleOptions(page);
+  // ALWAYS dismiss the popover before throwing -- otherwise it stays open
+  // and breaks subsequent stages with "covered by popover" failures.
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(300);
+  throw new Error(
+    'Failed to pick linked record for "' + label + '". Tried: ' +
+    valuesToTry.join(', ') + '. Visible on page: ' +
+    (visible.length ? visible.slice(0, 12).join(' | ') : 'none')
+  );
 }
 
 async function chooseLinkedProject(page, value) {
@@ -907,10 +1068,10 @@ async function submitObservationForm(req, res) {
 
 app.get('/', (req, res) => res.json({
   ok: true, service: 'AI Safety Manager Form Service',
-  submit_mode: SUBMIT_MODE, version: 'v23-resilient-visibility',
+  submit_mode: SUBMIT_MODE, version: 'v25-screenshot-accurate-picker',
   endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
 }));
-app.get('/health', (req, res) => res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v23-resilient-visibility' }));
+app.get('/health', (req, res) => res.json({ ok: true, submit_mode: SUBMIT_MODE, version: 'v25-screenshot-accurate-picker' }));
 app.post('/', submitObservationForm);
 app.post('/submit-observation-form', submitObservationForm);
 
