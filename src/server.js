@@ -600,29 +600,72 @@ async function withFallback(page, { fieldName, value, defaultValue, primaryFn, f
   }
 }
 
-function airtableDateLabel(iso) { const [y, m, d] = iso.split('-').map(Number); return m + '/' + d + '/' + y; }
-function airtableTimeLabel(h, m) {
-  const mer = h >= 12 ? 'pm' : 'am'; let h12 = h % 12; if (h12 === 0) h12 = 12;
-  return h12 + ':' + String(m).padStart(2, '0') + mer;
-}
+
 
 async function setInputValueByPlaceholder(page, ph, value) {
   if (!value) return '';
-  const input = page.locator(`input[placeholder*="${ph}"]`).first();
-  if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) { console.warn(`[${ph}] input not visible, skipping`); return ''; }
-  await input.evaluate((el, nv) => {
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-    if (setter) setter.call(el, nv); else el.value = nv;
+
+  const selectors = [
+    `input[placeholder*="${ph}"]`,
+    ph.includes('mm/dd') ? 'input[placeholder*="MM/DD"]' : '',
+    ph.includes('mm/dd') ? 'input[aria-label*="Date"]' : '',
+    ph.includes('hh:mm') ? 'input[placeholder*="hh:mm"]' : '',
+    ph.includes('hh:mm') ? 'input[placeholder*="HH:MM"]' : '',
+    ph.includes('hh:mm') ? 'input[aria-label*="Time"]' : '',
+  ].filter(Boolean);
+
+  let input = null;
+
+  for (const selector of selectors) {
+    const candidate = page.locator(selector).first();
+    if (await candidate.isVisible({ timeout: 1500 }).catch(() => false)) {
+      input = candidate;
+      break;
+    }
+  }
+
+  if (!input) {
+    console.warn(`[${ph}] input not visible, trying focused fallback`);
+    return '';
+  }
+
+  await input.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => undefined);
+  await input.click({ timeout: 3000, force: true }).catch(() => undefined);
+
+  // Real keyboard input works better with Airtable React fields.
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => undefined);
+  await page.keyboard.press('Backspace').catch(() => undefined);
+  await page.keyboard.type(String(value), { delay: 25 });
+
+  await input.evaluate((el) => {
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     el.dispatchEvent(new Event('blur', { bubbles: true }));
-  }, String(value));
-  await page.keyboard.press('Escape').catch(() => undefined);
-  await page.waitForTimeout(200);
+  }).catch(() => undefined);
+
+  await page.keyboard.press('Tab').catch(() => undefined);
+  await page.waitForTimeout(300);
+
   return value;
 }
 
-async function pickDate(page, iso) { if (!iso) return ''; return setInputValueByPlaceholder(page, 'mm/dd', airtableDateLabel(iso)); }
+function airtableDateLabel(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
+  return `${m}/${d}/${y}`;
+}
+
+function airtableTimeLabel(h, m) {
+  const mer = h >= 12 ? 'pm' : 'am';
+  let h12 = h % 12;
+  if (h12 === 0) h12 = 12;
+  return `${h12}:${String(m).padStart(2, '0')}${mer}`;
+}
+
+async function pickDate(page, iso) {
+  if (!iso) return '';
+  return setInputValueByPlaceholder(page, 'mm/dd', airtableDateLabel(iso));
+}
+
 async function pickTime(page, hhmm) {
   if (!hhmm) return '';
   const [h, m] = hhmm.split(':').map(Number);
@@ -698,8 +741,8 @@ function stageTimeout(name) {
   if (name === 'wait Airtable network idle') return 25000;
   if (name === 'wait Airtable form ready') return FORM_READY_TIMEOUT_MS + 5000;
   if (name === 'wait for form inputs') return FORM_READY_TIMEOUT_MS + 5000;
-  if (name === 'fill date') return 9000;
-  if (name === 'fill time') return 7000;
+  if (name === 'fill date') return 20000;
+if (name === 'fill time') return 15000;
   if (name === 'choose project site' || name === 'choose contractor observed') return 60000;
   if (name === 'fill company') return 20000;
   if (name === 'choose type of observation' || name === 'choose stop work authority' || name === 'choose follow-up status') return 20000;
