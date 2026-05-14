@@ -220,30 +220,104 @@ function comboByLabel(page, label) {
 async function fillText(page, label, value) {
   if (!value) return;
 
-  const field = byLabel(page, label);
-  await field.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+  console.log(`[fillText] filling "${label}" with:`, value);
 
+  const labelLocator = page
+    .getByText(label, { exact: true })
+    .or(page.getByText(labelRegex(label)))
+    .first();
+
+  await labelLocator.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS }).catch(() => undefined);
+
+  // First try normal accessible label fill
   try {
-    await field.fill(String(value), { timeout: ACTION_TIMEOUT_MS });
-    return;
+    const field = byLabel(page, label);
+    if (await field.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await field.fill(String(value), { timeout: 5000 });
+      return;
+    }
   } catch {
-    await field.evaluate((element, nextValue) => {
+    // continue to DOM fallback
+  }
+
+  // DOM fallback: find the nearest input/textarea after the visible label text
+  const filled = await page.evaluate(
+    ({ labelText, nextValue }) => {
+      const normalize = (text) => String(text || '').trim().replace(/\s+/g, ' ');
+
+      const allNodes = Array.from(document.querySelectorAll('div, label, span, p'));
+      const labelNode = allNodes.find((node) => {
+        const style = window.getComputedStyle(node);
+        const box = node.getBoundingClientRect();
+        const text = normalize(node.textContent);
+
+        return (
+          style.visibility !== 'hidden' &&
+          style.display !== 'none' &&
+          box.width > 0 &&
+          box.height > 0 &&
+          text.includes(labelText)
+        );
+      });
+
+      if (!labelNode) return false;
+
+      const labelBox = labelNode.getBoundingClientRect();
+
+      const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]), textarea'));
+
+      const candidates = inputs
+        .filter((input) => {
+          const style = window.getComputedStyle(input);
+          const box = input.getBoundingClientRect();
+
+          return (
+            style.visibility !== 'hidden' &&
+            style.display !== 'none' &&
+            box.width > 0 &&
+            box.height > 0 &&
+            box.top >= labelBox.top - 10
+          );
+        })
+        .sort((a, b) => {
+          const aBox = a.getBoundingClientRect();
+          const bBox = b.getBoundingClientRect();
+          return aBox.top - bBox.top;
+        });
+
+      const input = candidates[0];
+
+      if (!input) return false;
+
+      input.focus();
+
       const prototype =
-        element instanceof HTMLTextAreaElement
+        input instanceof HTMLTextAreaElement
           ? HTMLTextAreaElement.prototype
           : HTMLInputElement.prototype;
 
       const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
 
       if (setter) {
-        setter.call(element, nextValue);
+        setter.call(input, nextValue);
       } else {
-        element.value = nextValue;
+        input.value = nextValue;
       }
 
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-      element.dispatchEvent(new Event('change', { bubbles: true }));
-    }, String(value));
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new Event('blur', { bubbles: true }));
+
+      return true;
+    },
+    {
+      labelText: label,
+      nextValue: String(value),
+    }
+  );
+
+  if (!filled) {
+    throw new Error(`Unable to fill text field "${label}"`);
   }
 }
 
@@ -1109,7 +1183,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
   const companyValue = payload.company_name || FIELD_DEFAULTS.company_name;
   await fillText(page, 'Name of Company', companyValue);
   return companyValue;
-   }
+}
 );
 
     if (!isUnsetOption(payload.contractor_observed)) {
