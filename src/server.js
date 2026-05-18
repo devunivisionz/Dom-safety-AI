@@ -23,14 +23,17 @@ const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000)
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
 const CAPTURE_SCREENSHOTS = process.env.FORM_CAPTURE_SCREENSHOTS === 'true';
-const SERVICE_VERSION = 'v34-skip-screenshots';
+// FIX: bumped to v35-validation-details
+const SERVICE_VERSION = 'v35-validation-details';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
   reporter_name: 'Dominique Palmer',
   reporter_email: 'Palmerdom84@gmail.com',
   company_name: 'Turner Construction',
-  contractor_observed: 'Other',
+  // FIX: removed contractor_observed: 'Other' default.
+  // Selecting "Other" triggers a required conditional text sub-field that was
+  // never filled, causing Airtable validation_error. Field is now skipped when unset.
   contractor_observed_other: 'None',
   type_of_observation: 'Unsafe Condition',
   type_of_hazard: 'Arc Flash (Arco eléctrico)',
@@ -134,7 +137,8 @@ function normalizePayload(rawBody) {
   const sw = normalizeStopWork(body.stop_work_authority_used);
   const fu = normalizeFollowUp(body.followup_status);
   const contractorValue = clean(body.contractor_observed);
-  const useOtherContractor = isUnsetOption(contractorValue);
+  // FIX: track whether contractor should be skipped entirely
+  const skipContractor = isUnsetOption(contractorValue);
   const daysToComplete = Number(body.days_to_complete || body.number_of_days_to_complete || FIELD_DEFAULTS.days_to_complete);
   return {
     test_mode: false,
@@ -145,10 +149,10 @@ function normalizePayload(rawBody) {
     reporter_name: clean(body.reporter_name) || FIELD_DEFAULTS.reporter_name,
     reporter_email: clean(body.reporter_email) || FIELD_DEFAULTS.reporter_email,
     company_name: clean(body.company_name) || FIELD_DEFAULTS.company_name,
-    contractor_observed: useOtherContractor ? FIELD_DEFAULTS.contractor_observed : contractorValue,
-    contractor_observed_other: useOtherContractor
-      ? clean(body.contractor_observed_other) || FIELD_DEFAULTS.contractor_observed_other
-      : clean(body.contractor_observed_other),
+    // FIX: do NOT default to 'Other' when contractor is unset
+    skip_contractor: skipContractor,
+    contractor_observed: skipContractor ? '' : contractorValue,
+    contractor_observed_other: skipContractor ? '' : clean(body.contractor_observed_other),
     type_of_observation: obs,
     type_of_hazard: clean(body.type_of_hazard) || FIELD_DEFAULTS.type_of_hazard,
     positive_safe_observation: clean(body.positive_safe_observation),
@@ -180,6 +184,7 @@ function withTimeout(promise, ms, msg) {
   return Promise.race([promise, t]).finally(() => clearTimeout(tid));
 }
 
+// FIX: was returning dd/mm/yyyy — Airtable date picker expects mm/dd/yyyy.
 function airtableDateLabel(iso) {
   const [y, m, d] = iso.split('-').map(Number);
   return m + '/' + d + '/' + y;
@@ -230,7 +235,8 @@ function stageTimeout(name) {
   if (name === 'choose positive safe observation') return 30000;
   if (name === 'choose stop work authority') return 15000;
   if (name === 'fill description') return 15000;
-  if (name === 'choose follow-up status') return 15000;
+  // FIX: bumped timeout — conditional fields need a moment to render after this
+  if (name === 'choose follow-up status') return 20000;
   if (name === 'fill corrective action') return 15000;
   if (name === 'fill days to complete') return 10000;
   if (name === 'check confirmation') return 10000;
@@ -464,10 +470,8 @@ async function fillTextNearLabel(page, labelSubstring, value) {
   `[fillText] timed out setting "${labelSubstring}"`);
 
   console.log('[fillText] result:', JSON.stringify(result));
-  const filled = result.filled;
-
-  if (!filled) console.warn(`[fillText] unable to fill "${labelSubstring}", continuing`);
-  return filled ? value : '';
+  if (!result.filled) console.warn(`[fillText] unable to fill "${labelSubstring}", continuing`);
+  return result.filled ? value : '';
 }
 
 async function clickByText(page, target, { exact = true, partial = false, maxLen = 200 } = {}) {
@@ -576,18 +580,18 @@ async function chooseLinkedProject(page, value) {
   throw new Error('Project Site: could not select "' + target + '"');
 }
 
+// FIX: only called when contractor_observed is a real named contractor (not None/unset).
+// The skip_contractor flag in normalizePayload gates whether this runs at all.
 async function chooseContractorObserved(page, value) {
-  const target = value || 'None';
+  const target = value;
   console.log('[contractor_observed] selecting:', target);
 
   await dismissOpenPopover(page);
 
-  // Find the dropdown by label
   const labelLoc = page.getByText(/Name of Contractor Observed/i).first();
   await labelLoc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
   await page.waitForTimeout(500);
 
-  // Click to open dropdown
   const dropdown = page.locator('select, [role="combobox"], [role="listbox"]')
     .filter({ hasText: /Contractor/i })
     .first();
@@ -596,7 +600,6 @@ async function chooseContractorObserved(page, value) {
     await dropdown.click({ force: true });
     await page.waitForTimeout(800);
   } else {
-    // Try clicking near the label
     await page.evaluate(() => {
       const labels = Array.from(document.querySelectorAll('label, div, span'));
       const lbl = labels.find((l) => l.textContent.toLowerCase().includes('contractor'));
@@ -608,10 +611,9 @@ async function chooseContractorObserved(page, value) {
     await page.waitForTimeout(800);
   }
 
-  // Try to select "None" or first option
-  let clicked = await clickByText(page, 'None', { exact: true, partial: false, maxLen: 50 });
-  if (!clicked) clicked = await clickByText(page, target, { exact: false, partial: true, maxLen: 100 });
-  
+  let clicked = await clickByText(page, target, { exact: true, partial: false, maxLen: 120 });
+  if (!clicked) clicked = await clickByText(page, target, { exact: false, partial: true, maxLen: 120 });
+
   if (!clicked) {
     const firstOpt = page.locator('[role="option"]').first();
     if (await firstOpt.isVisible({ timeout: 3000 }).catch(() => false)) {
@@ -626,8 +628,8 @@ async function chooseContractorObserved(page, value) {
     return target;
   }
 
-  console.warn('[contractor_observed] could not select, using default');
-  return target;
+  console.warn('[contractor_observed] could not select, skipping');
+  return '';
 }
 
 async function clickRadioOption(page, optionLabel) {
@@ -648,12 +650,10 @@ async function chooseTypeOfHazard(page, value) {
   const target = value || 'Arc Flash (Arco eléctrico)';
   console.log('[type_of_hazard] selecting:', target);
 
-  // Find label and click to open
   const labelLoc = page.getByText(/Type of Hazard/i).first();
   await labelLoc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
   await page.waitForTimeout(500);
 
-  // Click the field area to open dropdown
   await page.evaluate(() => {
     const labels = Array.from(document.querySelectorAll('label, div, span'));
     const lbl = labels.find((l) => l.textContent.toLowerCase().includes('type of hazard') || l.textContent.toLowerCase().includes('tipo de peligro'));
@@ -670,7 +670,6 @@ async function chooseTypeOfHazard(page, value) {
 
   await page.waitForTimeout(1000);
 
-  // Try exact match first
   let clicked = await clickByText(page, target, { exact: true, partial: false, maxLen: 150 });
   if (!clicked) clicked = await clickByText(page, target, { exact: false, partial: true, maxLen: 150 });
 
@@ -680,7 +679,6 @@ async function chooseTypeOfHazard(page, value) {
     return target;
   }
 
-  // Try search box
   const searchBox = page.locator(
     'input[placeholder*="Search"], input[placeholder*="Find"], input[placeholder*="search"], input[placeholder*="Select"]',
   ).first();
@@ -696,7 +694,6 @@ async function chooseTypeOfHazard(page, value) {
     }
   }
 
-  // Click first option as fallback
   const firstOpt = page.locator('[role="option"]').first();
   if (await firstOpt.isVisible({ timeout: 3000 }).catch(() => false)) {
     const txt = await firstOpt.textContent();
@@ -777,7 +774,6 @@ async function checkCheckboxIfPresent(page, labelSubstring) {
           }
         }
       }
-      // Last resort: click any visible unchecked checkbox
       const visible = checkboxes.find((cb) => {
         const b = cb.getBoundingClientRect();
         return b.width > 0 && b.height > 0 && !cb.checked;
@@ -798,6 +794,32 @@ async function checkCheckboxIfPresent(page, labelSubstring) {
   return false;
 }
 
+/**
+ * Scrape Airtable validation error text visible on the page after a failed submit.
+ */
+async function scrapeValidationErrors(page) {
+  try {
+    return await page.evaluate(() => {
+      const selectors = [
+        '[class*="error"]',
+        '[class*="validation"]',
+        '[aria-invalid="true"]',
+        '[role="alert"]',
+      ];
+      const texts = [];
+      for (const sel of selectors) {
+        document.querySelectorAll(sel).forEach((el) => {
+          const t = el.textContent?.trim();
+          if (t && t.length < 400) texts.push(t);
+        });
+      }
+      return [...new Set(texts)];
+    });
+  } catch {
+    return [];
+  }
+}
+
 async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
   const tmpDir = await mkdtemp(join(tmpdir(), 'safety-observation-'));
   const selected = { ...payload.selected_values };
@@ -808,6 +830,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
   let stageName = 'initializing';
   let submitOutcome = 'not_attempted';
   let submitDetail = '';
+  let validationDetails = [];
 
   const stage = async (name, fn) => {
     stageName = name;
@@ -864,8 +887,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       console.warn('[wait for form inputs] no visible inputs — proceeding');
     });
 
-    // === REQUIRED FIELDS ===
-
+    // FIX: airtableDateLabel now returns mm/dd/yyyy (was dd/mm/yyyy)
     await stage('fill date', async () => {
       const [h, m] = payload.time.split(':').map(Number);
       await fillDateTimeNearLabel(
@@ -883,10 +905,12 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await stage('fill reporter name', () =>
       fillTextNearLabel(page, 'Your Name (First and Last)', payload.reporter_name),
     );
+    selected.reporter_name = payload.reporter_name;
 
     await stage('fill reporter email', () =>
       fillTextNearLabel(page, 'Your Email Address', payload.reporter_email),
     );
+    selected.reporter_email = payload.reporter_email;
 
     selected.company_name = await stage('fill company', async () => {
       const cv = payload.company_name || FIELD_DEFAULTS.company_name;
@@ -894,16 +918,25 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       return cv;
     });
 
-    // REQUIRED: Contractor Observed
-    selected.contractor_observed = await stage('choose contractor observed', () =>
-      chooseContractorObserved(page, payload.contractor_observed),
-    );
-
-    await stage('fill contractor observed other', async () => {
-      if (payload.contractor_observed !== 'Other') return;
-      await page.waitForTimeout(800);
-      await fillTextNearLabel(page, 'Name of Contractor', payload.contractor_observed_other);
-    });
+    // FIX: skip Contractor Observed entirely when value is None/unset.
+    // Previously defaulted to "Other", which opens a required "Name of Contractor"
+    // sub-field. That sub-field was never filled, causing Airtable validation_error.
+    if (payload.skip_contractor) {
+      console.log('[contractor_observed] skip_contractor=true, leaving field blank');
+      selected.contractor_observed = 'skipped:unset';
+    } else {
+      selected.contractor_observed = await stage('choose contractor observed', () =>
+        chooseContractorObserved(page, payload.contractor_observed),
+      );
+      // FIX: only fill sub-field when Other was intentionally selected
+      if (payload.contractor_observed === 'Other' && payload.contractor_observed_other) {
+        await stage('fill contractor observed other', async () => {
+          await page.waitForTimeout(800);
+          await fillTextNearLabel(page, 'Name of Contractor', payload.contractor_observed_other);
+        });
+        selected.contractor_observed_other = payload.contractor_observed_other;
+      }
+    }
 
     const obsLabel = TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]
       || TYPE_OF_OBSERVATION_LABELS[FIELD_DEFAULTS.type_of_observation];
@@ -919,7 +952,6 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
         choosePositiveSafeObservation(page, payload.positive_safe_observation),
       );
     } else {
-      // REQUIRED for unsafe observations.
       selected.type_of_hazard = await stage('choose type of hazard', () =>
         chooseTypeOfHazard(page, payload.type_of_hazard),
       );
@@ -941,8 +973,11 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
         useOriginal ? 'Description of Event (original)' : 'Description of Event',
         text,
       );
+      selected.description_of_event = text;
     });
 
+    // FIX: select follow-up status BEFORE filling corrective action and days_to_complete.
+    // Those fields are conditionally rendered by Airtable only after this radio is chosen.
     const fuLabel = FOLLOW_UP_LABELS[payload.followup_status]
       || FOLLOW_UP_LABELS[FIELD_DEFAULTS.followup_status];
 
@@ -950,16 +985,26 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       clickRadioOption(page, fuLabel),
     );
 
-    await page.waitForTimeout(1000);
+    // Wait for conditional fields to appear in DOM after radio selection
+    await page.waitForTimeout(1200);
 
+    // FIX: corrective action filled after followup (may be conditional)
     await stage('fill corrective action', async () => {
       if (!payload.corrective_action) return;
       await fillTextNearLabel(page, 'Corrective Action', payload.corrective_action);
+      selected.corrective_action = payload.corrective_action;
     });
 
+    // FIX: days_to_complete is required when followup = 'Follow Up Needed'.
+    // Was never filled in v34, causing validation_error on Airtable's side.
     await stage('fill days to complete', async () => {
-      if (payload.followup_status !== 'Follow Up Needed') return;
-      await fillTextNearLabel(page, 'Number of days to complete', payload.days_to_complete);
+      if (payload.followup_status !== 'Follow Up Needed') {
+        selected.days_to_complete = 'skipped:not-required';
+        return;
+      }
+      const days = String(payload.days_to_complete || FIELD_DEFAULTS.days_to_complete);
+      await fillTextNearLabel(page, 'Number of days to complete', days);
+      selected.days_to_complete = days;
     });
 
     selected.confirmation_checked = await stage('check confirmation',
@@ -1032,11 +1077,17 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       submitDetail = JSON.stringify(result || {});
       console.log('[submit form] outcome signal:', kind, submitDetail);
 
+      if (kind === 'validation_error') {
+        // FIX: scrape exactly which fields Airtable is complaining about
+        validationDetails = await scrapeValidationErrors(page);
+        console.log('[submit form] validation_details:', JSON.stringify(validationDetails));
+        return 'validation_error';
+      }
+
       if (kind === 'success_text' || kind === 'url_changed' || kind === 'submit_button_hidden') {
         submitted = true;
         return 'success_' + kind;
       }
-      if (kind === 'validation_error') return 'validation_error';
       return 'unclear';
     });
 
@@ -1061,10 +1112,11 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       submit_mode: SUBMIT_MODE,
       selected_values: selected,
       fallbacks_used: fallbacksUsed,
-      // Artifacts removed - not needed for successful submit
+      ...(validationDetails.length ? { validation_details: validationDetails } : {}),
     };
 
   } catch (error) {
+    validationDetails = page ? await scrapeValidationErrors(page).catch(() => []) : [];
     if (context) await withTimeout(context.close(), 5000, 'close context timeout').catch(() => undefined);
     if (browser) await withTimeout(browser.close(), 5000, 'close browser timeout').catch(() => undefined);
     return {
@@ -1077,6 +1129,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       fallbacks_used: fallbacksUsed,
       failed_stage: stageName,
       error: '[' + stageName + '] ' + error.message,
+      ...(validationDetails.length ? { validation_details: validationDetails } : {}),
     };
   }
 }
