@@ -23,8 +23,7 @@ const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000)
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
 const CAPTURE_SCREENSHOTS = process.env.FORM_CAPTURE_SCREENSHOTS === 'true';
-// FIX: bumped to v35-validation-details
-const SERVICE_VERSION = 'v35-validation-details';
+const SERVICE_VERSION = 'v36-layered-fill';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -225,9 +224,9 @@ function stageTimeout(name) {
   if (name === 'fill date') return 20000;
   if (name === 'fill time') return 10000;
   if (name === 'choose project site') return 60000;
-  if (name === 'fill reporter name') return 10000;
-  if (name === 'fill reporter email') return 10000;
-  if (name === 'fill company') return 10000;
+  if (name === 'fill reporter name') return 18000;
+  if (name === 'fill reporter email') return 18000;
+  if (name === 'fill company') return 18000;
   if (name === 'choose contractor observed') return 30000;
   if (name === 'fill contractor observed other') return 15000;
   if (name === 'choose type of observation') return 15000;
@@ -362,18 +361,81 @@ async function fillDateTimeNearLabel(page, labelSubstring, dateValue, timeValue)
   return true;
 }
 
+/**
+ * Fill a visible text/textarea input identified by its label.
+ *
+ * Strategy (each layer tried in order, first success wins):
+ *   1. Playwright getByLabel — exact match, then regex allowing optional * suffix
+ *   2. Playwright getByPlaceholder — for inputs whose placeholder echoes the label
+ *   3. Playwright getByRole textbox with accessible name
+ *   4. DOM proximity heuristic (original approach) inside page.evaluate
+ *
+ * Never throws — logs a warning and returns '' on total failure so the caller
+ * can decide whether to hard-fail the stage.
+ */
 async function fillTextNearLabel(page, labelSubstring, value) {
   if (!value) return '';
   console.log(`[fillText] "${labelSubstring}" => "${value}"`);
+  const val = String(value);
+  const FILL_TIMEOUT = 5000;
 
+  // Helper: attempt a fill on a Playwright locator, return true on success
+  async function tryLocator(loc, tag) {
+    try {
+      const el = loc.first();
+      await el.waitFor({ state: 'visible', timeout: FILL_TIMEOUT });
+      await el.fill(val, { timeout: FILL_TIMEOUT });
+      // Verify the fill actually registered
+      const got = await el.inputValue({ timeout: 2000 }).catch(() => null);
+      if (got !== null && got.length > 0) {
+        console.log(`[fillText] success via ${tag}`);
+        return true;
+      }
+      // Value didn't stick — try native setter + events
+      await el.evaluate((node, v) => {
+        const proto = node instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(node, v); else node.value = v;
+        node.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: v }));
+        node.dispatchEvent(new Event('change', { bubbles: true }));
+        node.dispatchEvent(new Event('blur', { bubbles: true }));
+      }, val);
+      console.log(`[fillText] success via ${tag} (native setter)`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Layer 1a: exact label match
+  if (await tryLocator(page.getByLabel(labelSubstring, { exact: true }), 'getByLabel:exact')) return val;
+
+  // Layer 1b: label with optional trailing whitespace / asterisk (Airtable adds * for required)
+  const labelRe = new RegExp('^' + labelSubstring.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\*?\\s*$', 'i');
+  if (await tryLocator(page.getByLabel(labelRe), 'getByLabel:regex')) return val;
+
+  // Layer 2: role=textbox with accessible name
+  if (await tryLocator(
+    page.getByRole('textbox', { name: labelSubstring }),
+    'getByRole:textbox',
+  )) return val;
+
+  // Layer 3: placeholder contains the label words (e.g. "First and Last")
+  const words = labelSubstring.split(/\s+/).filter((w) => w.length > 3);
+  for (const word of words) {
+    if (await tryLocator(page.getByPlaceholder(word, { exact: false }), `getByPlaceholder:${word}`)) return val;
+  }
+
+  // Layer 4: DOM proximity heuristic (original approach, now a last resort)
+  console.warn(`[fillText] layers 1-3 missed "${labelSubstring}", trying DOM heuristic`);
   const result = await withTimeout(page.evaluate(({ labelText, nextValue }) => {
     const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
     const isVisible = (node) => {
       if (!node) return false;
       const s = window.getComputedStyle(node);
       const b = node.getBoundingClientRect();
-      return s.visibility !== 'hidden' && s.display !== 'none'
-        && b.width > 0 && b.height > 0;
+      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
     };
     const target = labelText.toLowerCase();
     const labels = Array.from(document.querySelectorAll('label, div, span, p'))
@@ -401,19 +463,16 @@ async function fillTextNearLabel(page, labelSubstring, value) {
       const box = el.getBoundingClientRect();
       return {
         tag: el.tagName.toLowerCase(),
-        type: el.getAttribute('type') || '',
         aria: el.getAttribute('aria-label') || '',
-        className: String(el.className || ''),
         placeholder: el.getAttribute('placeholder') || '',
         top: Math.round(box.top),
         left: Math.round(box.left),
         width: Math.round(box.width),
-        height: Math.round(box.height),
       };
     };
+
     let input = null;
     let labelNode = null;
-
     for (const candidateLabel of labels) {
       const lb = candidateLabel.getBoundingClientRect();
       const scored = inputs
@@ -425,53 +484,40 @@ async function fillTextNearLabel(page, labelSubstring, value) {
           return {
             candidate,
             usable,
-            score: (usable ? 0 : 10000)
-              + Math.abs(belowDistance)
-              + horizontalDistance / 20
+            score: (usable ? 0 : 10000) + Math.abs(belowDistance) + horizontalDistance / 20
               + (candidate.tagName.toLowerCase() === 'textarea' ? -5 : 0),
           };
         })
-        .filter((entry) => entry.usable)
+        .filter((e) => e.usable)
         .sort((a, b) => a.score - b.score);
-      if (scored[0]) {
-        input = scored[0].candidate;
-        labelNode = candidateLabel;
-        break;
-      }
+      if (scored[0]) { input = scored[0].candidate; labelNode = candidateLabel; break; }
     }
 
-    if (!input) {
-      return {
-        filled: false,
-        labelCount: labels.length,
-        target: labelText,
-        visibleInputs: inputs.map(describe),
-      };
-    }
+    if (!input) return { filled: false, labelCount: labels.length, visibleInputs: inputs.map(describe) };
 
     input.focus();
     const proto = input instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype
-      : HTMLInputElement.prototype;
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
     if (setter) setter.call(input, nextValue); else input.value = nextValue;
-    const inputEvent = typeof InputEvent === 'function'
+    const ev = typeof InputEvent === 'function'
       ? new InputEvent('input', { bubbles: true, inputType: 'insertText', data: nextValue })
       : new Event('input', { bubbles: true });
-    input.dispatchEvent(inputEvent);
+    input.dispatchEvent(ev);
     input.dispatchEvent(new Event('change', { bubbles: true }));
     input.dispatchEvent(new Event('blur', { bubbles: true }));
-    return {
-      filled: true,
-      label: labelNode ? normalize(labelNode.textContent) : '',
-      target: describe(input),
-    };
-  }, { labelText: labelSubstring, nextValue: String(value) }), 8000,
-  `[fillText] timed out setting "${labelSubstring}"`);
+    return { filled: true, label: labelNode ? normalize(labelNode.textContent) : '', target: describe(input) };
+  }, { labelText: labelSubstring, nextValue: val }), 8000, `[fillText] DOM heuristic timed out for "${labelSubstring}"`).catch((e) => {
+    console.warn('[fillText] DOM heuristic threw:', e.message);
+    return { filled: false };
+  });
 
-  console.log('[fillText] result:', JSON.stringify(result));
-  if (!result.filled) console.warn(`[fillText] unable to fill "${labelSubstring}", continuing`);
-  return result.filled ? value : '';
+  if (result.filled) {
+    console.log(`[fillText] success via DOM heuristic for "${labelSubstring}"`);
+    return val;
+  }
+  console.warn(`[fillText] ALL layers failed for "${labelSubstring}", visibleInputs:`, JSON.stringify(result.visibleInputs));
+  return '';
 }
 
 async function clickByText(page, target, { exact = true, partial = false, maxLen = 200 } = {}) {
