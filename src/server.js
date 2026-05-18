@@ -22,7 +22,7 @@ const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 9
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
-const SERVICE_VERSION = 'v29-project-picker-fallback';
+const SERVICE_VERSION = 'v30-date-click-type-fallback';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -264,57 +264,75 @@ async function fillInputByPlaceholderFragment(page, fragment, value) {
 
 async function fillDateTimeNearLabel(page, labelSubstring, dateValue, timeValue) {
   console.log(`[fillDateTime] "${labelSubstring}" => "${dateValue}" "${timeValue || ''}"`);
-  const filled = await page.evaluate(({ labelText, nextDate, nextTime }) => {
+
+  const byLabelFilled = await page
+    .getByLabel(new RegExp(escapeRegExp(labelSubstring), 'i'))
+    .first()
+    .fill(String(dateValue), { timeout: 3000 })
+    .then(() => true)
+    .catch(() => false);
+
+  if (byLabelFilled) {
+    if (timeValue) {
+      await page.keyboard.press('Tab').catch(() => undefined);
+      await page.keyboard.type(String(timeValue), { delay: 20 }).catch(() => undefined);
+    }
+    await page.keyboard.press('Escape').catch(() => undefined);
+    await page.waitForTimeout(300);
+    return true;
+  }
+
+  const clicked = await page.evaluate(({ labelText }) => {
     const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
     const allNodes = Array.from(document.querySelectorAll('div, label, span, p'));
-    const labelNode = allNodes.find((node) => {
+    const isVisible = (node) => {
       const s = window.getComputedStyle(node);
       const b = node.getBoundingClientRect();
-      return s.visibility !== 'hidden' && s.display !== 'none'
-        && b.width > 0 && b.height > 0
-        && normalize(node.textContent).toLowerCase().includes(labelText.toLowerCase());
-    });
-    if (!labelNode) return false;
-
-    const labelBox = labelNode.getBoundingClientRect();
-    const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"])'));
-    const candidates = inputs
-      .filter((input) => {
-        const s = window.getComputedStyle(input);
-        const b = input.getBoundingClientRect();
-        return s.visibility !== 'hidden' && s.display !== 'none'
-          && b.width > 0 && b.height > 0
-          && b.top >= labelBox.top - 8
-          && b.top <= labelBox.top + 260;
+      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
+    };
+    const target = labelText.toLowerCase();
+    const labelNode = allNodes
+      .filter((node) => {
+        if (!isVisible(node)) return false;
+        const text = normalize(node.textContent).toLowerCase();
+        return text === target || text.includes(target);
       })
       .sort((a, b) => {
+        const ta = normalize(a.textContent).toLowerCase();
+        const tb = normalize(b.textContent).toLowerCase();
+        const exactA = ta === target ? 0 : 1;
+        const exactB = tb === target ? 0 : 1;
+        if (exactA !== exactB) return exactA - exactB;
+        if (ta.length !== tb.length) return ta.length - tb.length;
         const ab = a.getBoundingClientRect();
         const bb = b.getBoundingClientRect();
-        return ab.top - bb.top || ab.left - bb.left;
-      });
-
-    const setValue = (input, value) => {
-      if (!input || !value) return false;
-      input.focus();
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-      if (setter) setter.call(input, value); else input.value = value;
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-      input.dispatchEvent(new Event('blur', { bubbles: true }));
+        return (ab.width * ab.height) - (bb.width * bb.height);
+      })[0];
+    if (!labelNode) return false;
+    const box = labelNode.getBoundingClientRect();
+    const x = box.left + Math.min(Math.max(box.width / 2, 20), 280);
+    const y = box.bottom + 34;
+    const targetNode = document.elementFromPoint(x, y);
+    if (targetNode instanceof HTMLElement) {
+      targetNode.scrollIntoView({ block: 'center' });
+      targetNode.click();
       return true;
-    };
+    }
+    return false;
+  }, { labelText: labelSubstring });
 
-    const dateInput = candidates[0];
-    const timeInput = candidates[1];
-    const didDate = setValue(dateInput, String(nextDate));
-    const didTime = nextTime ? setValue(timeInput, String(nextTime)) : true;
-    return didDate && didTime;
-  }, { labelText: labelSubstring, nextDate: String(dateValue), nextTime: timeValue ? String(timeValue) : '' });
-
-  if (!filled) console.warn(`[fillDateTime] unable to fill "${labelSubstring}"`);
+  if (!clicked) throw new Error(`Unable to locate "${labelSubstring}" date field`);
+  await page.waitForTimeout(300);
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => undefined);
+  await page.keyboard.type(String(dateValue), { delay: 20 });
+  if (timeValue) {
+    await page.keyboard.press('Tab').catch(() => undefined);
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => undefined);
+    await page.keyboard.type(String(timeValue), { delay: 20 }).catch(() => undefined);
+  }
   await page.keyboard.press('Escape').catch(() => undefined);
   await page.waitForTimeout(300);
-  return filled;
+  return true;
 }
 
 async function fillTextNearLabel(page, labelSubstring, value) {
