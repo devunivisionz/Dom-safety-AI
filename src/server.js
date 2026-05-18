@@ -22,7 +22,7 @@ const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 9
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
-const SERVICE_VERSION = 'v31-date-direct-input';
+const SERVICE_VERSION = 'v32-date-dom-evaluate';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -216,7 +216,7 @@ function stageTimeout(name) {
   if (name === 'wait Airtable network idle') return 25000;
   if (name === 'wait Airtable form ready') return FORM_READY_TIMEOUT_MS + 5000;
   if (name === 'wait for form inputs') return FORM_READY_TIMEOUT_MS + 5000;
-  if (name === 'fill date') return 10000;
+  if (name === 'fill date') return 20000;
   if (name === 'fill time') return 10000;
   if (name === 'choose project site') return 60000;
   if (name === 'fill reporter name') return 10000;
@@ -262,40 +262,92 @@ async function fillInputByPlaceholderFragment(page, fragment, value) {
   return value;
 }
 
-async function setInputValue(locator, value, timeout = 5000) {
-  const input = locator.first();
-  if (!(await input.isVisible({ timeout }).catch(() => false))) return false;
-
-  await input.evaluate((el, nextValue) => {
-    el.focus();
-    const proto = el instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype
-      : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-    if (setter) setter.call(el, nextValue); else el.value = nextValue;
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new Event('blur', { bubbles: true }));
-  }, String(value));
-
-  return true;
-}
-
 async function fillDateTimeNearLabel(page, labelSubstring, dateValue, timeValue) {
   console.log(`[fillDateTime] "${labelSubstring}" => "${dateValue}" "${timeValue || ''}"`);
 
-  const dateFilled = await setInputValue(
-    page.locator('input.date[placeholder="mm/dd/yyyy"], input[placeholder="mm/dd/yyyy"]'),
-    dateValue,
-  );
-  if (!dateFilled) throw new Error(`Unable to fill "${labelSubstring}" date input`);
+  const result = await withTimeout(
+    page.evaluate(({ nextDateValue, nextTimeValue }) => {
+      const isVisible = (node) => {
+        if (!node) return false;
+        const style = window.getComputedStyle(node);
+        const box = node.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && box.width > 0
+          && box.height > 0;
+      };
+      const inputEntries = Array.from(document.querySelectorAll('input:not([type="hidden"])'))
+        .filter(isVisible)
+        .map((el, index) => {
+          const box = el.getBoundingClientRect();
+          return {
+            el,
+            index,
+            aria: el.getAttribute('aria-label') || '',
+            className: String(el.className || ''),
+            placeholder: el.getAttribute('placeholder') || '',
+            role: el.getAttribute('role') || '',
+            type: el.getAttribute('type') || '',
+            top: Math.round(box.top),
+            left: Math.round(box.left),
+            width: Math.round(box.width),
+          };
+        });
+      const metadata = (entry) => entry && {
+        index: entry.index,
+        aria: entry.aria,
+        className: entry.className,
+        placeholder: entry.placeholder,
+        role: entry.role,
+        type: entry.type,
+        top: entry.top,
+        left: entry.left,
+        width: entry.width,
+      };
+      const dateEntry = inputEntries.find((entry) =>
+        entry.placeholder.toLowerCase() === 'mm/dd/yyyy' || /\bdate\b/i.test(entry.className))
+        || inputEntries.find((entry) =>
+          entry.placeholder.toLowerCase().includes('mm/dd')
+          || entry.aria.toLowerCase().includes('date'));
+      const timeEntry = inputEntries.find((entry) =>
+        entry.aria.toLowerCase() === 'time' || /\btimeinput\b/i.test(entry.className))
+        || inputEntries.find((entry) =>
+          entry.placeholder.toLowerCase().includes('hh:mm')
+          || entry.aria.toLowerCase().includes('time'));
 
-  if (timeValue) {
-    const timeFilled = await setInputValue(
-      page.locator('input.timeInput[aria-label="Time"], input[placeholder="hh:mm pm"]'),
-      timeValue,
-    );
-    if (!timeFilled) throw new Error(`Unable to fill "${labelSubstring}" time input`);
+      const setValue = (entry, value) => {
+        if (!entry) return false;
+        const el = entry.el;
+        el.focus();
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        if (setter) setter.call(el, value); else el.value = value;
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
+        return true;
+      };
+
+      return {
+        dateFilled: setValue(dateEntry, String(nextDateValue || '')),
+        timeFilled: nextTimeValue ? setValue(timeEntry, String(nextTimeValue)) : true,
+        dateTarget: metadata(dateEntry),
+        timeTarget: metadata(timeEntry),
+        visibleInputs: inputEntries.map(metadata),
+      };
+    }, {
+      nextDateValue: String(dateValue),
+      nextTimeValue: timeValue ? String(timeValue) : '',
+    }),
+    12000,
+    `[fillDateTime] timed out setting "${labelSubstring}" inputs`,
+  );
+
+  console.log('[fillDateTime] result:', JSON.stringify(result));
+  if (!result.dateFilled) {
+    throw new Error(`Unable to fill "${labelSubstring}" date input: ${JSON.stringify(result)}`);
+  }
+  if (timeValue && !result.timeFilled) {
+    throw new Error(`Unable to fill "${labelSubstring}" time input: ${JSON.stringify(result)}`);
   }
 
   await page.keyboard.press('Escape').catch(() => undefined);
