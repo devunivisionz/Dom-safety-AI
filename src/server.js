@@ -23,16 +23,13 @@ const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000)
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
 const CAPTURE_SCREENSHOTS = process.env.FORM_CAPTURE_SCREENSHOTS === 'true';
-const SERVICE_VERSION = 'v37-stabilized-stages';
+const SERVICE_VERSION = 'v38-direct-textarea-fill';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
   reporter_name: 'Dominique Palmer',
   reporter_email: 'Palmerdom84@gmail.com',
   company_name: 'Turner Construction',
-  // FIX: removed contractor_observed: 'Other' default.
-  // Selecting "Other" triggers a required conditional text sub-field that was
-  // never filled, causing Airtable validation_error. Field is now skipped when unset.
   contractor_observed_other: 'None',
   type_of_observation: 'Unsafe Condition',
   type_of_hazard: 'Arc Flash (Arco eléctrico)',
@@ -136,7 +133,6 @@ function normalizePayload(rawBody) {
   const sw = normalizeStopWork(body.stop_work_authority_used);
   const fu = normalizeFollowUp(body.followup_status);
   const contractorValue = clean(body.contractor_observed);
-  // FIX: track whether contractor should be skipped entirely
   const skipContractor = isUnsetOption(contractorValue);
   const daysToComplete = Number(body.days_to_complete || body.number_of_days_to_complete || FIELD_DEFAULTS.days_to_complete);
   return {
@@ -148,7 +144,6 @@ function normalizePayload(rawBody) {
     reporter_name: clean(body.reporter_name) || FIELD_DEFAULTS.reporter_name,
     reporter_email: clean(body.reporter_email) || FIELD_DEFAULTS.reporter_email,
     company_name: clean(body.company_name) || FIELD_DEFAULTS.company_name,
-    // FIX: do NOT default to 'Other' when contractor is unset
     skip_contractor: skipContractor,
     contractor_observed: skipContractor ? '' : contractorValue,
     contractor_observed_other: skipContractor ? '' : clean(body.contractor_observed_other),
@@ -183,7 +178,6 @@ function withTimeout(promise, ms, msg) {
   return Promise.race([promise, t]).finally(() => clearTimeout(tid));
 }
 
-// FIX: was returning dd/mm/yyyy — Airtable date picker expects mm/dd/yyyy.
 function airtableDateLabel(iso) {
   const [y, m, d] = iso.split('-').map(Number);
   return m + '/' + d + '/' + y;
@@ -233,8 +227,7 @@ function stageTimeout(name) {
   if (name === 'choose type of hazard') return 30000;
   if (name === 'choose positive safe observation') return 30000;
   if (name === 'choose stop work authority') return 15000;
-  if (name === 'fill description') return 25000;
-  // FIX: bumped timeout — conditional fields need a moment to render after this
+  if (name === 'fill description') return 15000;
   if (name === 'choose follow-up status') return 20000;
   if (name === 'fill corrective action') return 15000;
   if (name === 'fill days to complete') return 10000;
@@ -361,37 +354,22 @@ async function fillDateTimeNearLabel(page, labelSubstring, dateValue, timeValue)
   return true;
 }
 
-/**
- * Fill a visible text/textarea input identified by its label.
- *
- * Strategy (each layer tried in order, first success wins):
- *   1. Playwright getByLabel — exact match, then regex allowing optional * suffix
- *   2. Playwright getByPlaceholder — for inputs whose placeholder echoes the label
- *   3. Playwright getByRole textbox with accessible name
- *   4. DOM proximity heuristic (original approach) inside page.evaluate
- *
- * Never throws — logs a warning and returns '' on total failure so the caller
- * can decide whether to hard-fail the stage.
- */
 async function fillTextNearLabel(page, labelSubstring, value) {
   if (!value) return '';
   console.log(`[fillText] "${labelSubstring}" => "${value}"`);
   const val = String(value);
   const FILL_TIMEOUT = 5000;
 
-  // Helper: attempt a fill on a Playwright locator, return true on success
   async function tryLocator(loc, tag) {
     try {
       const el = loc.first();
       await el.waitFor({ state: 'visible', timeout: FILL_TIMEOUT });
       await el.fill(val, { timeout: FILL_TIMEOUT });
-      // Verify the fill actually registered
       const got = await el.inputValue({ timeout: 2000 }).catch(() => null);
       if (got !== null && got.length > 0) {
         console.log(`[fillText] success via ${tag}`);
         return true;
       }
-      // Value didn't stick — try native setter + events
       await el.evaluate((node, v) => {
         const proto = node instanceof HTMLTextAreaElement
           ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -408,115 +386,22 @@ async function fillTextNearLabel(page, labelSubstring, value) {
     }
   }
 
-  // Layer 1a: exact label match
   if (await tryLocator(page.getByLabel(labelSubstring, { exact: true }), 'getByLabel:exact')) return val;
 
-  // Layer 1b: label with optional trailing whitespace / asterisk (Airtable adds * for required)
   const labelRe = new RegExp('^' + labelSubstring.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\*?\\s*$', 'i');
   if (await tryLocator(page.getByLabel(labelRe), 'getByLabel:regex')) return val;
 
-  // Layer 2: role=textbox with accessible name
   if (await tryLocator(
     page.getByRole('textbox', { name: labelSubstring }),
     'getByRole:textbox',
   )) return val;
 
-  // Layer 3: placeholder contains the label words (e.g. "First and Last")
   const words = labelSubstring.split(/\s+/).filter((w) => w.length > 3);
   for (const word of words) {
     if (await tryLocator(page.getByPlaceholder(word, { exact: false }), `getByPlaceholder:${word}`)) return val;
   }
 
-  // Layer 4: DOM proximity heuristic (original approach, now a last resort)
-  console.warn(`[fillText] layers 1-3 missed "${labelSubstring}", trying DOM heuristic`);
-  const result = await withTimeout(page.evaluate(({ labelText, nextValue }) => {
-    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
-    const isVisible = (node) => {
-      if (!node) return false;
-      const s = window.getComputedStyle(node);
-      const b = node.getBoundingClientRect();
-      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
-    };
-    const target = labelText.toLowerCase();
-    const labels = Array.from(document.querySelectorAll('label, div, span, p'))
-      .filter((node) => {
-        if (!isVisible(node)) return false;
-        const text = normalize(node.textContent).toLowerCase();
-        return text === target || text.includes(target);
-      })
-      .sort((a, b) => {
-        const at = normalize(a.textContent).toLowerCase();
-        const bt = normalize(b.textContent).toLowerCase();
-        const exactA = at === target ? 0 : 1;
-        const exactB = bt === target ? 0 : 1;
-        if (exactA !== exactB) return exactA - exactB;
-        if (at.length !== bt.length) return at.length - bt.length;
-        const ab = a.getBoundingClientRect();
-        const bb = b.getBoundingClientRect();
-        return (ab.width * ab.height) - (bb.width * bb.height);
-      });
-    const inputs = Array.from(document.querySelectorAll(
-      'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea',
-    )).filter(isVisible);
-    const describe = (el) => {
-      if (!el) return null;
-      const box = el.getBoundingClientRect();
-      return {
-        tag: el.tagName.toLowerCase(),
-        aria: el.getAttribute('aria-label') || '',
-        placeholder: el.getAttribute('placeholder') || '',
-        top: Math.round(box.top),
-        left: Math.round(box.left),
-        width: Math.round(box.width),
-      };
-    };
-
-    let input = null;
-    let labelNode = null;
-    for (const candidateLabel of labels) {
-      const lb = candidateLabel.getBoundingClientRect();
-      const scored = inputs
-        .map((candidate) => {
-          const box = candidate.getBoundingClientRect();
-          const belowDistance = box.top - lb.bottom;
-          const horizontalDistance = Math.abs((box.left + box.width / 2) - (lb.left + lb.width / 2));
-          const usable = belowDistance >= -12 && belowDistance <= 180;
-          return {
-            candidate,
-            usable,
-            score: (usable ? 0 : 10000) + Math.abs(belowDistance) + horizontalDistance / 20
-              + (candidate.tagName.toLowerCase() === 'textarea' ? -5 : 0),
-          };
-        })
-        .filter((e) => e.usable)
-        .sort((a, b) => a.score - b.score);
-      if (scored[0]) { input = scored[0].candidate; labelNode = candidateLabel; break; }
-    }
-
-    if (!input) return { filled: false, labelCount: labels.length, visibleInputs: inputs.map(describe) };
-
-    input.focus();
-    const proto = input instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-    if (setter) setter.call(input, nextValue); else input.value = nextValue;
-    const ev = typeof InputEvent === 'function'
-      ? new InputEvent('input', { bubbles: true, inputType: 'insertText', data: nextValue })
-      : new Event('input', { bubbles: true });
-    input.dispatchEvent(ev);
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('blur', { bubbles: true }));
-    return { filled: true, label: labelNode ? normalize(labelNode.textContent) : '', target: describe(input) };
-  }, { labelText: labelSubstring, nextValue: val }), 8000, `[fillText] DOM heuristic timed out for "${labelSubstring}"`).catch((e) => {
-    console.warn('[fillText] DOM heuristic threw:', e.message);
-    return { filled: false };
-  });
-
-  if (result.filled) {
-    console.log(`[fillText] success via DOM heuristic for "${labelSubstring}"`);
-    return val;
-  }
-  console.warn(`[fillText] ALL layers failed for "${labelSubstring}", visibleInputs:`, JSON.stringify(result.visibleInputs));
+  console.warn(`[fillText] ALL layers failed for "${labelSubstring}"`);
   return '';
 }
 
@@ -584,149 +469,58 @@ async function fillFocusedOrVisibleInput(page, value) {
 }
 
 /**
- * Generic Airtable combo/select field: click the field container near a label,
- * type to search, click the matching option.
- * Used for Company, Contractor Observed, Type of Hazard, and any other select field.
+ * FIX v38: Direct textarea fill with keyboard input and immediate Tab press.
+ * No internal waiting — fill, verify, press Tab, continue.
+ * Supports both by-label and by-index fallback.
  */
-async function chooseComboField(page, labelText, value) {
-  if (!value) return '';
-  const target = String(value);
-  console.log(`[chooseCombo] "${labelText}" => "${target}"`);
+async function fillTextareaSafe(page, labelText, value, fallbackIndex = 0) {
+  console.log(`[fillTextareaSafe] ${labelText} => ${value}`);
 
-  await dismissOpenPopover(page);
+  if (!value) return false;
 
-  // Step 1: find and click the field container to open the dropdown
-  const opened = await page.evaluate((lbl) => {
-    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ').toLowerCase();
-    const lt = normalize(lbl);
-    const isVisible = (el) => {
-      const s = window.getComputedStyle(el);
-      const b = el.getBoundingClientRect();
-      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
-    };
-    // Find the label element
-    const allText = Array.from(document.querySelectorAll('label, div, span, p')).filter(isVisible);
-    const labelEl = allText
-      .filter((el) => normalize(el.textContent) === lt || normalize(el.textContent).startsWith(lt))
-      .sort((a, b) => a.textContent.length - b.textContent.length)[0];
-    if (!labelEl) return false;
-    // Walk up to find the field container and click it
-    const container = labelEl.closest('[class*="field"], [class*="cell"], section')
-      || labelEl.parentElement?.parentElement
-      || labelEl.parentElement;
-    if (container) {
-      container.scrollIntoView({ block: 'center' });
-      container.click();
-      return true;
-    }
-    labelEl.click();
+  const textareas = page.locator('textarea:visible');
+  const count = await textareas.count();
+
+  if (!count) {
+    throw new Error(`No visible textarea found for ${labelText}`);
+  }
+
+  // First try by label
+  try {
+    const byLabel = page.getByLabel(labelText, { exact: false });
+    await byLabel.waitFor({ state: 'visible', timeout: 5000 });
+    await byLabel.click({ timeout: 5000 });
+    await byLabel.fill('');
+    await byLabel.type(String(value), { delay: 10 });
+    await byLabel.press('Tab');
+
+    console.log(`[fillTextareaSafe] success via label`);
     return true;
-  }, labelText);
-
-  if (!opened) {
-    console.warn(`[chooseCombo] could not find label "${labelText}"`);
-    return '';
+  } catch (err) {
+    console.log(`[fillTextareaSafe] label failed: ${err.message}, using fallback textarea index ${fallbackIndex}`);
   }
 
-  await page.waitForTimeout(800);
+  // Fallback by textarea index
+  const target = textareas.nth(fallbackIndex);
 
-  // Step 2: type into search box
-  await fillFocusedOrVisibleInput(page, target);
+  await target.waitFor({ state: 'visible', timeout: 5000 });
+  await target.scrollIntoViewIfNeeded();
+  await target.click({ timeout: 5000 });
+  await page.waitForTimeout(200);
 
-  // Step 3: click the matching option
-  let clicked = await clickByText(page, target, { exact: true, partial: false, maxLen: 200 });
-  if (!clicked) clicked = await clickByText(page, target, { exact: false, partial: true, maxLen: 200 });
+  // Keyboard input often works better with Airtable
+  await target.fill('');
+  await target.type(String(value), { delay: 10 });
+  await target.press('Tab');
 
-  if (clicked) {
-    await page.waitForTimeout(400);
-    await page.keyboard.press('Escape').catch(() => undefined);
-    console.log(`[chooseCombo] selected "${target}"`);
-    return target;
+  const currentValue = await target.inputValue().catch(() => '');
+  console.log(`[fillTextareaSafe] current value after Tab: ${currentValue.slice(0, 50)}`);
+
+  if (!currentValue || !currentValue.includes(String(value).slice(0, 5))) {
+    throw new Error(`Textarea value not confirmed for ${labelText}`);
   }
 
-  // Fallback: click first visible option
-  const firstOpt = page.locator('[role="option"]').first();
-  if (await firstOpt.isVisible({ timeout: 2000 }).catch(() => false)) {
-    const txt = (await firstOpt.textContent() || '').trim();
-    await firstOpt.click();
-    await page.waitForTimeout(400);
-    await page.keyboard.press('Escape').catch(() => undefined);
-    console.warn(`[chooseCombo] fallback: selected first option "${txt}" for "${labelText}"`);
-    return txt;
-  }
-
-  console.warn(`[chooseCombo] no option found for "${labelText}" value "${target}"`);
-  return '';
-}
-
-/**
- * Fill a textarea that Airtable renders without a usable label or placeholder.
- * Strategy: find the label text node, then find the nearest textarea below it.
- * Falls back to filling by textarea index (0=description, 1=corrective action).
- */
-async function fillTextareaByLabel(page, labelText, value, fallbackIndex = 0) {
-  if (!value) return '';
-  console.log(`[fillTextarea] "${labelText}" => "${value}" (fallbackIndex=${fallbackIndex})`);
-  const val = String(value);
-
-  const filled = await page.evaluate(({ lbl, nextValue, fbIdx }) => {
-    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
-    const isVisible = (el) => {
-      const s = window.getComputedStyle(el);
-      const b = el.getBoundingClientRect();
-      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
-    };
-    const fill = (el) => {
-      el.focus();
-      const proto = el instanceof HTMLTextAreaElement
-        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-      if (setter) setter.call(el, nextValue); else el.value = nextValue;
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: nextValue }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      el.dispatchEvent(new Event('blur', { bubbles: true }));
-    };
-
-    const allText = Array.from(document.querySelectorAll('label, div, span, p')).filter(isVisible);
-    const lt = normalize(lbl).toLowerCase();
-    const labelEl = allText
-      .filter((el) => normalize(el.textContent).toLowerCase().includes(lt))
-      .sort((a, b) => a.textContent.length - b.textContent.length)[0];
-
-    const textareas = Array.from(document.querySelectorAll(
-      'textarea, [contenteditable="true"], [role="textbox"]',
-    )).filter(isVisible);
-
-    if (labelEl) {
-      const lb = labelEl.getBoundingClientRect();
-      const below = textareas
-        .map((ta) => {
-          const box = ta.getBoundingClientRect();
-          return { ta, dist: box.top - lb.bottom };
-        })
-        .filter((e) => e.dist >= -20 && e.dist <= 300)
-        .sort((a, b) => a.dist - b.dist);
-      if (below[0]) {
-        fill(below[0].ta);
-        return { ok: true, method: 'proximity' };
-      }
-    }
-
-    // Fallback: use index
-    if (textareas[fbIdx]) {
-      fill(textareas[fbIdx]);
-      return { ok: true, method: `index:${fbIdx}` };
-    }
-
-    return { ok: false, count: textareas.length };
-  }, { lbl: labelText, nextValue: val, fbIdx: fallbackIndex });
-
-  if (filled.ok) {
-    console.log(`[fillTextarea] success via ${filled.method}`);
-    return val;
-  }
-  console.warn(`[fillTextarea] failed for "${labelText}", textarea count=${filled.count}`);
-  return '';
+  return true;
 }
 
 async function chooseLinkedProject(page, value) {
@@ -772,8 +566,6 @@ async function chooseLinkedProject(page, value) {
   throw new Error('Project Site: could not select "' + target + '"');
 }
 
-// FIX: only called when contractor_observed is a real named contractor (not None/unset).
-// The skip_contractor flag in normalizePayload gates whether this runs at all.
 async function chooseContractorObserved(page, value) {
   const target = value;
   console.log('[contractor_observed] selecting:', target);
@@ -986,9 +778,6 @@ async function checkCheckboxIfPresent(page, labelSubstring) {
   return false;
 }
 
-/**
- * Scrape Airtable validation error text visible on the page after a failed submit.
- */
 async function scrapeValidationErrors(page) {
   try {
     return await page.evaluate(() => {
@@ -1079,7 +868,6 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       console.warn('[wait for form inputs] no visible inputs — proceeding');
     });
 
-    // FIX: airtableDateLabel now returns mm/dd/yyyy (was dd/mm/yyyy)
     await stage('fill date', async () => {
       const [h, m] = payload.time.split(':').map(Number);
       await fillDateTimeNearLabel(
@@ -1104,16 +892,10 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     );
     selected.reporter_email = payload.reporter_email;
 
-    // Company is a combo/select field, not a plain text input
-    selected.company_name = await stage('fill company', async () => {
-      const cv = payload.company_name || FIELD_DEFAULTS.company_name;
-      const chosen = await chooseComboField(page, 'Name of Company', cv);
-      return chosen || cv;
-    });
+    selected.company_name = await stage('fill company', () =>
+      fillTextNearLabel(page, 'Name of Company', payload.company_name || FIELD_DEFAULTS.company_name),
+    );
 
-    // FIX: skip Contractor Observed entirely when value is None/unset.
-    // Previously defaulted to "Other", which opens a required "Name of Contractor"
-    // sub-field. That sub-field was never filled, causing Airtable validation_error.
     if (payload.skip_contractor) {
       console.log('[contractor_observed] skip_contractor=true, leaving field blank');
       selected.contractor_observed = 'skipped:unset';
@@ -1121,7 +903,6 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       selected.contractor_observed = await stage('choose contractor observed', () =>
         chooseContractorObserved(page, payload.contractor_observed),
       );
-      // FIX: only fill sub-field when Other was intentionally selected
       if (payload.contractor_observed === 'Other' && payload.contractor_observed_other) {
         await stage('fill contractor observed other', async () => {
           await page.waitForTimeout(800);
@@ -1157,22 +938,17 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       clickRadioOption(page, swLabel),
     );
 
-    // FIX: Stabilize page before filling description to prevent browser crash
+    // FIX v38: Use direct textarea fill with keyboard input
     await stage('fill description', async () => {
-      const text = payload.description_of_event;
-      if (!text) return;
-      // Ensure any open popovers/dropdowns are dismissed and page is stable
-      await dismissOpenPopover(page);
-      await page.waitForTimeout(600);
-      // Description is an unlabelled textarea — use positional fill (index 0)
-      const result = await fillTextareaByLabel(page, 'Description of Event', text, 0);
-      // If proximity fill failed, try the (original) label variant as a last resort
-      if (!result) await fillTextNearLabel(page, 'Description of Event (original)', text);
-      selected.description_of_event = text;
+      if (payload.description_of_event) {
+        await fillTextareaSafe(page, 'Description of Event', payload.description_of_event, 0);
+        selected.description_of_event = payload.description_of_event;
+      }
     });
 
-    // FIX: select follow-up status BEFORE filling corrective action and days_to_complete.
-    // Those fields are conditionally rendered by Airtable only after this radio is chosen.
+    await page.waitForTimeout(500);
+
+    // FIX: select follow-up status BEFORE filling corrective action and days_to_complete
     const fuLabel = FOLLOW_UP_LABELS[payload.followup_status]
       || FOLLOW_UP_LABELS[FIELD_DEFAULTS.followup_status];
 
@@ -1180,27 +956,25 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       clickRadioOption(page, fuLabel),
     );
 
-    // Wait for conditional fields to appear in DOM after radio selection
+    // Wait for conditional fields to appear in DOM
     await page.waitForTimeout(1200);
 
-    // FIX: corrective action is also an unlabelled textarea — use positional fill (index 1)
+    // FIX v38: Use direct textarea fill for corrective action
     await stage('fill corrective action', async () => {
-      if (!payload.corrective_action) return;
-      await fillTextareaByLabel(page, 'Corrective Action', payload.corrective_action, 1);
-      selected.corrective_action = payload.corrective_action;
+      if (payload.corrective_action) {
+        await fillTextareaSafe(page, 'Corrective Action', payload.corrective_action, 1);
+        selected.corrective_action = payload.corrective_action;
+      }
     });
 
-    // FIX: days_to_complete is required when followup = 'Follow Up Needed'.
-    // It's a numeric input — try fillTextNearLabel first (it has a real label),
-    // fall back to fillTextareaByLabel proximity.
+    // FIX: days_to_complete is required when followup = 'Follow Up Needed'
     await stage('fill days to complete', async () => {
       if (payload.followup_status !== 'Follow Up Needed') {
         selected.days_to_complete = 'skipped:not-required';
         return;
       }
       const days = String(payload.days_to_complete || FIELD_DEFAULTS.days_to_complete);
-      const r = await fillTextNearLabel(page, 'Number of days to complete', days);
-      if (!r) await fillTextareaByLabel(page, 'Number of days to complete', days, 2);
+      await fillTextNearLabel(page, 'Number of days to complete', days);
       selected.days_to_complete = days;
     });
 
@@ -1275,7 +1049,6 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       console.log('[submit form] outcome signal:', kind, submitDetail);
 
       if (kind === 'validation_error') {
-        // FIX: scrape exactly which fields Airtable is complaining about
         validationDetails = await scrapeValidationErrors(page);
         console.log('[submit form] validation_details:', JSON.stringify(validationDetails));
         return 'validation_error';
