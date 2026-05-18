@@ -22,7 +22,7 @@ const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 9
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
-const SERVICE_VERSION = 'v30-date-click-type-fallback';
+const SERVICE_VERSION = 'v31-date-direct-input';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -262,74 +262,42 @@ async function fillInputByPlaceholderFragment(page, fragment, value) {
   return value;
 }
 
+async function setInputValue(locator, value, timeout = 5000) {
+  const input = locator.first();
+  if (!(await input.isVisible({ timeout }).catch(() => false))) return false;
+
+  await input.evaluate((el, nextValue) => {
+    el.focus();
+    const proto = el instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    if (setter) setter.call(el, nextValue); else el.value = nextValue;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur', { bubbles: true }));
+  }, String(value));
+
+  return true;
+}
+
 async function fillDateTimeNearLabel(page, labelSubstring, dateValue, timeValue) {
   console.log(`[fillDateTime] "${labelSubstring}" => "${dateValue}" "${timeValue || ''}"`);
 
-  const byLabelFilled = await page
-    .getByLabel(new RegExp(escapeRegExp(labelSubstring), 'i'))
-    .first()
-    .fill(String(dateValue), { timeout: 3000 })
-    .then(() => true)
-    .catch(() => false);
+  const dateFilled = await setInputValue(
+    page.locator('input.date[placeholder="mm/dd/yyyy"], input[placeholder="mm/dd/yyyy"]'),
+    dateValue,
+  );
+  if (!dateFilled) throw new Error(`Unable to fill "${labelSubstring}" date input`);
 
-  if (byLabelFilled) {
-    if (timeValue) {
-      await page.keyboard.press('Tab').catch(() => undefined);
-      await page.keyboard.type(String(timeValue), { delay: 20 }).catch(() => undefined);
-    }
-    await page.keyboard.press('Escape').catch(() => undefined);
-    await page.waitForTimeout(300);
-    return true;
-  }
-
-  const clicked = await page.evaluate(({ labelText }) => {
-    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
-    const allNodes = Array.from(document.querySelectorAll('div, label, span, p'));
-    const isVisible = (node) => {
-      const s = window.getComputedStyle(node);
-      const b = node.getBoundingClientRect();
-      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
-    };
-    const target = labelText.toLowerCase();
-    const labelNode = allNodes
-      .filter((node) => {
-        if (!isVisible(node)) return false;
-        const text = normalize(node.textContent).toLowerCase();
-        return text === target || text.includes(target);
-      })
-      .sort((a, b) => {
-        const ta = normalize(a.textContent).toLowerCase();
-        const tb = normalize(b.textContent).toLowerCase();
-        const exactA = ta === target ? 0 : 1;
-        const exactB = tb === target ? 0 : 1;
-        if (exactA !== exactB) return exactA - exactB;
-        if (ta.length !== tb.length) return ta.length - tb.length;
-        const ab = a.getBoundingClientRect();
-        const bb = b.getBoundingClientRect();
-        return (ab.width * ab.height) - (bb.width * bb.height);
-      })[0];
-    if (!labelNode) return false;
-    const box = labelNode.getBoundingClientRect();
-    const x = box.left + Math.min(Math.max(box.width / 2, 20), 280);
-    const y = box.bottom + 34;
-    const targetNode = document.elementFromPoint(x, y);
-    if (targetNode instanceof HTMLElement) {
-      targetNode.scrollIntoView({ block: 'center' });
-      targetNode.click();
-      return true;
-    }
-    return false;
-  }, { labelText: labelSubstring });
-
-  if (!clicked) throw new Error(`Unable to locate "${labelSubstring}" date field`);
-  await page.waitForTimeout(300);
-  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => undefined);
-  await page.keyboard.type(String(dateValue), { delay: 20 });
   if (timeValue) {
-    await page.keyboard.press('Tab').catch(() => undefined);
-    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => undefined);
-    await page.keyboard.type(String(timeValue), { delay: 20 }).catch(() => undefined);
+    const timeFilled = await setInputValue(
+      page.locator('input.timeInput[aria-label="Time"], input[placeholder="hh:mm pm"]'),
+      timeValue,
+    );
+    if (!timeFilled) throw new Error(`Unable to fill "${labelSubstring}" time input`);
   }
+
   await page.keyboard.press('Escape').catch(() => undefined);
   await page.waitForTimeout(300);
   return true;
