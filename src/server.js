@@ -22,7 +22,8 @@ const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 9
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
-const SERVICE_VERSION = 'v33-dom-text-fill';
+const CAPTURE_SCREENSHOTS = process.env.FORM_CAPTURE_SCREENSHOTS === 'true';
+const SERVICE_VERSION = 'v34-skip-screenshots';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -979,10 +980,12 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       });
     }
 
-    const beforeSubmitPath = join(tmpDir, 'before-submit.png');
-    const beforeSubmitScreenshot = await stage('capture before-submit screenshot',
-      () => safeScreenshot(page, beforeSubmitPath),
-    );
+    if (CAPTURE_SCREENSHOTS) {
+      const beforeSubmitPath = join(tmpDir, 'before-submit.png');
+      await stage('capture before-submit screenshot',
+        () => safeScreenshot(page, beforeSubmitPath),
+      );
+    }
 
     submitOutcome = await stage('submit form', async () => {
       const submitButton = page
@@ -1037,12 +1040,14 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       return 'unclear';
     });
 
-    const afterLabel = submitted ? 'success'
-      : submitOutcome === 'validation_error' ? 'validation-error' : 'unclear';
-    const afterPath = join(tmpDir, `after-submit-${afterLabel}.png`);
-    const finalScreenshot = await stage('capture final screenshot',
-      () => safeScreenshot(page, afterPath),
-    );
+    if (CAPTURE_SCREENSHOTS) {
+      const afterLabel = submitted ? 'success'
+        : submitOutcome === 'validation_error' ? 'validation-error' : 'unclear';
+      const afterPath = join(tmpDir, `after-submit-${afterLabel}.png`);
+      await stage('capture final screenshot',
+        () => safeScreenshot(page, afterPath),
+      );
+    }
 
     await withTimeout(context.close(), 5000, 'close context timeout').catch(() => undefined);
     await withTimeout(browser.close(), 5000, 'close browser timeout').catch(() => undefined);
