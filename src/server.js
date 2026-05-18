@@ -28,11 +28,13 @@ const FIELD_DEFAULTS = {
   reporter_name: 'Dominique Palmer',
   reporter_email: 'Palmerdom84@gmail.com',
   company_name: 'Turner Construction',
-  contractor_observed: 'None',
+  contractor_observed: 'Other',
+  contractor_observed_other: 'None',
   type_of_observation: 'Unsafe Condition',
   type_of_hazard: 'Arc Flash (Arco eléctrico)',
   stop_work_authority_used: 'Not Required',
   followup_status: 'Follow Up Needed',
+  days_to_complete: 2,
 };
 
 const TYPE_OF_OBSERVATION_LABELS = {
@@ -129,6 +131,9 @@ function normalizePayload(rawBody) {
   if (obs === 'Positive/Safe Observation' && !clean(body.positive_safe_observation)) obs = 'Unsafe Condition';
   const sw = normalizeStopWork(body.stop_work_authority_used);
   const fu = normalizeFollowUp(body.followup_status);
+  const contractorValue = clean(body.contractor_observed);
+  const useOtherContractor = isUnsetOption(contractorValue);
+  const daysToComplete = Number(body.days_to_complete || body.number_of_days_to_complete || FIELD_DEFAULTS.days_to_complete);
   return {
     test_mode: false,
     record_id: clean(body.record_id),
@@ -138,7 +143,10 @@ function normalizePayload(rawBody) {
     reporter_name: clean(body.reporter_name) || FIELD_DEFAULTS.reporter_name,
     reporter_email: clean(body.reporter_email) || FIELD_DEFAULTS.reporter_email,
     company_name: clean(body.company_name) || FIELD_DEFAULTS.company_name,
-    contractor_observed: clean(body.contractor_observed) || FIELD_DEFAULTS.contractor_observed,
+    contractor_observed: useOtherContractor ? FIELD_DEFAULTS.contractor_observed : contractorValue,
+    contractor_observed_other: useOtherContractor
+      ? clean(body.contractor_observed_other) || FIELD_DEFAULTS.contractor_observed_other
+      : clean(body.contractor_observed_other),
     type_of_observation: obs,
     type_of_hazard: clean(body.type_of_hazard) || FIELD_DEFAULTS.type_of_hazard,
     positive_safe_observation: clean(body.positive_safe_observation),
@@ -146,6 +154,9 @@ function normalizePayload(rawBody) {
     description_of_event: clean(body.description_of_event),
     corrective_action: clean(body.corrective_action),
     followup_status: fu,
+    days_to_complete: Number.isFinite(daysToComplete)
+      ? Math.max(1, Math.min(3, daysToComplete))
+      : FIELD_DEFAULTS.days_to_complete,
     photo_base64: clean(body.photo_base64),
     photo_url: clean(body.photo_url),
     photo_filename: clean(body.photo_filename) || (clean(body.record_id)
@@ -211,12 +222,15 @@ function stageTimeout(name) {
   if (name === 'fill reporter email') return 10000;
   if (name === 'fill company') return 10000;
   if (name === 'choose contractor observed') return 30000;
+  if (name === 'fill contractor observed other') return 15000;
   if (name === 'choose type of observation') return 15000;
   if (name === 'choose type of hazard') return 30000;
+  if (name === 'choose positive safe observation') return 30000;
   if (name === 'choose stop work authority') return 15000;
   if (name === 'fill description') return 15000;
-  if (name === 'fill corrective action') return 15000;
   if (name === 'choose follow-up status') return 15000;
+  if (name === 'fill corrective action') return 15000;
+  if (name === 'fill days to complete') return 10000;
   if (name === 'check confirmation') return 10000;
   if (name === 'submit form') return 20000;
   if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
@@ -508,6 +522,58 @@ async function chooseTypeOfHazard(page, value) {
   return target;
 }
 
+async function choosePositiveSafeObservation(page, value) {
+  const target = value || 'Other (Otro)';
+  console.log('[positive_safe_observation] selecting:', target);
+
+  const visible = await isFieldVisible(page, 'Positive/Safe Observation', 5000);
+  if (!visible) {
+    console.warn('[positive_safe_observation] field not visible, skipping');
+    return '';
+  }
+
+  const labelLoc = page.getByText(/Positive\/Safe Observation/i).first();
+  await labelLoc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
+  await page.waitForTimeout(500);
+
+  await page.evaluate(() => {
+    const labels = Array.from(document.querySelectorAll('label, div, span'));
+    const lbl = labels.find((l) => l.textContent.toLowerCase().includes('positive/safe observation'));
+    if (lbl) {
+      const container = lbl.parentElement?.parentElement || lbl.closest('div[class*="field"], div[class*="cell"]');
+      if (container) {
+        container.scrollIntoView({ block: 'center' });
+        container.click();
+      } else {
+        lbl.click();
+      }
+    }
+  });
+
+  await page.waitForTimeout(1000);
+
+  let clicked = await clickByText(page, target, { exact: true, partial: false, maxLen: 180 });
+  if (!clicked) clicked = await clickByText(page, target, { exact: false, partial: true, maxLen: 180 });
+
+  if (clicked) {
+    await page.waitForTimeout(500);
+    await page.keyboard.press('Escape').catch(() => undefined);
+    return target;
+  }
+
+  const firstOpt = page.locator('[role="option"]').first();
+  if (await firstOpt.isVisible({ timeout: 3000 }).catch(() => false)) {
+    const txt = await firstOpt.textContent();
+    await firstOpt.click();
+    await page.waitForTimeout(500);
+    await page.keyboard.press('Escape').catch(() => undefined);
+    return (txt || target).trim();
+  }
+
+  console.warn('[positive_safe_observation] could not select "' + target + '"');
+  return '';
+}
+
 async function checkCheckboxIfPresent(page, labelSubstring) {
   try {
     const found = await page.evaluate((labelText) => {
@@ -645,6 +711,12 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       chooseContractorObserved(page, payload.contractor_observed),
     );
 
+    await stage('fill contractor observed other', async () => {
+      if (payload.contractor_observed !== 'Other') return;
+      await page.waitForTimeout(800);
+      await fillTextNearLabel(page, 'Name of Contractor', payload.contractor_observed_other);
+    });
+
     const obsLabel = TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]
       || TYPE_OF_OBSERVATION_LABELS[FIELD_DEFAULTS.type_of_observation];
 
@@ -654,10 +726,16 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
 
     await page.waitForTimeout(1000);
 
-    // REQUIRED: Type of Hazard
-    selected.type_of_hazard = await stage('choose type of hazard', () =>
-      chooseTypeOfHazard(page, payload.type_of_hazard),
-    );
+    if (payload.type_of_observation === 'Positive/Safe Observation') {
+      selected.positive_safe_observation = await stage('choose positive safe observation', () =>
+        choosePositiveSafeObservation(page, payload.positive_safe_observation),
+      );
+    } else {
+      // REQUIRED for unsafe observations.
+      selected.type_of_hazard = await stage('choose type of hazard', () =>
+        chooseTypeOfHazard(page, payload.type_of_hazard),
+      );
+    }
 
     const swLabel = STOP_WORK_LABELS[payload.stop_work_authority_used]
       || STOP_WORK_LABELS[FIELD_DEFAULTS.stop_work_authority_used];
@@ -677,17 +755,24 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       );
     });
 
-    await stage('fill corrective action', async () => {
-      if (!payload.corrective_action) return;
-      await fillTextNearLabel(page, 'Corrective Action', payload.corrective_action);
-    });
-
     const fuLabel = FOLLOW_UP_LABELS[payload.followup_status]
       || FOLLOW_UP_LABELS[FIELD_DEFAULTS.followup_status];
 
     selected.followup_status = await stage('choose follow-up status', () =>
       clickRadioOption(page, fuLabel),
     );
+
+    await page.waitForTimeout(1000);
+
+    await stage('fill corrective action', async () => {
+      if (!payload.corrective_action) return;
+      await fillTextNearLabel(page, 'Corrective Action', payload.corrective_action);
+    });
+
+    await stage('fill days to complete', async () => {
+      if (payload.followup_status !== 'Follow Up Needed') return;
+      await fillTextNearLabel(page, 'Number of days to complete', payload.days_to_complete);
+    });
 
     selected.confirmation_checked = await stage('check confirmation',
       () => checkCheckboxIfPresent(page, 'check this box'),
