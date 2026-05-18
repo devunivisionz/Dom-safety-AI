@@ -22,7 +22,7 @@ const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 9
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
-const SERVICE_VERSION = 'v32-date-dom-evaluate';
+const SERVICE_VERSION = 'v33-dom-text-fill';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -359,48 +359,111 @@ async function fillTextNearLabel(page, labelSubstring, value) {
   if (!value) return '';
   console.log(`[fillText] "${labelSubstring}" => "${value}"`);
 
-  const byLabelLoc = page.getByLabel(labelSubstring, { exact: false }).first();
-  if (await byLabelLoc.isVisible({ timeout: 3000 }).catch(() => false)) {
-    const tag = await byLabelLoc.evaluate((el) => el.tagName.toLowerCase());
-    if (tag === 'input' || tag === 'textarea') {
-      await byLabelLoc.fill(String(value), { timeout: 5000 });
-      return value;
-    }
-  }
-
-  const filled = await page.evaluate(({ labelText, nextValue }) => {
+  const result = await withTimeout(page.evaluate(({ labelText, nextValue }) => {
     const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
-    const allNodes = Array.from(document.querySelectorAll('div, label, span, p'));
-    const labelNode = allNodes.find((node) => {
+    const isVisible = (node) => {
+      if (!node) return false;
       const s = window.getComputedStyle(node);
       const b = node.getBoundingClientRect();
       return s.visibility !== 'hidden' && s.display !== 'none'
-        && b.width > 0 && b.height > 0
-        && normalize(node.textContent).toLowerCase().includes(labelText.toLowerCase());
-    });
-    if (!labelNode) return false;
-    const lb = labelNode.getBoundingClientRect();
-    const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'));
-    const candidates = inputs
-      .filter((i) => {
-        const s = window.getComputedStyle(i);
-        const b = i.getBoundingClientRect();
-        return s.visibility !== 'hidden' && s.display !== 'none'
-          && b.width > 0 && b.height > 0 && b.top >= lb.top - 10;
+        && b.width > 0 && b.height > 0;
+    };
+    const target = labelText.toLowerCase();
+    const labels = Array.from(document.querySelectorAll('label, div, span, p'))
+      .filter((node) => {
+        if (!isVisible(node)) return false;
+        const text = normalize(node.textContent).toLowerCase();
+        return text === target || text.includes(target);
       })
-      .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-    const input = candidates[0];
-    if (!input) return false;
+      .sort((a, b) => {
+        const at = normalize(a.textContent).toLowerCase();
+        const bt = normalize(b.textContent).toLowerCase();
+        const exactA = at === target ? 0 : 1;
+        const exactB = bt === target ? 0 : 1;
+        if (exactA !== exactB) return exactA - exactB;
+        if (at.length !== bt.length) return at.length - bt.length;
+        const ab = a.getBoundingClientRect();
+        const bb = b.getBoundingClientRect();
+        return (ab.width * ab.height) - (bb.width * bb.height);
+      });
+    const inputs = Array.from(document.querySelectorAll(
+      'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea',
+    )).filter(isVisible);
+    const describe = (el) => {
+      if (!el) return null;
+      const box = el.getBoundingClientRect();
+      return {
+        tag: el.tagName.toLowerCase(),
+        type: el.getAttribute('type') || '',
+        aria: el.getAttribute('aria-label') || '',
+        className: String(el.className || ''),
+        placeholder: el.getAttribute('placeholder') || '',
+        top: Math.round(box.top),
+        left: Math.round(box.left),
+        width: Math.round(box.width),
+        height: Math.round(box.height),
+      };
+    };
+    let input = null;
+    let labelNode = null;
+
+    for (const candidateLabel of labels) {
+      const lb = candidateLabel.getBoundingClientRect();
+      const scored = inputs
+        .map((candidate) => {
+          const box = candidate.getBoundingClientRect();
+          const belowDistance = box.top - lb.bottom;
+          const horizontalDistance = Math.abs((box.left + box.width / 2) - (lb.left + lb.width / 2));
+          const usable = belowDistance >= -12 && belowDistance <= 180;
+          return {
+            candidate,
+            usable,
+            score: (usable ? 0 : 10000)
+              + Math.abs(belowDistance)
+              + horizontalDistance / 20
+              + (candidate.tagName.toLowerCase() === 'textarea' ? -5 : 0),
+          };
+        })
+        .filter((entry) => entry.usable)
+        .sort((a, b) => a.score - b.score);
+      if (scored[0]) {
+        input = scored[0].candidate;
+        labelNode = candidateLabel;
+        break;
+      }
+    }
+
+    if (!input) {
+      return {
+        filled: false,
+        labelCount: labels.length,
+        target: labelText,
+        visibleInputs: inputs.map(describe),
+      };
+    }
+
     input.focus();
     const proto = input instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
     if (setter) setter.call(input, nextValue); else input.value = nextValue;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
+    const inputEvent = typeof InputEvent === 'function'
+      ? new InputEvent('input', { bubbles: true, inputType: 'insertText', data: nextValue })
+      : new Event('input', { bubbles: true });
+    input.dispatchEvent(inputEvent);
     input.dispatchEvent(new Event('change', { bubbles: true }));
     input.dispatchEvent(new Event('blur', { bubbles: true }));
-    return true;
-  }, { labelText: labelSubstring, nextValue: String(value) });
+    return {
+      filled: true,
+      label: labelNode ? normalize(labelNode.textContent) : '',
+      target: describe(input),
+    };
+  }, { labelText: labelSubstring, nextValue: String(value) }), 8000,
+  `[fillText] timed out setting "${labelSubstring}"`);
+
+  console.log('[fillText] result:', JSON.stringify(result));
+  const filled = result.filled;
 
   if (!filled) console.warn(`[fillText] unable to fill "${labelSubstring}", continuing`);
   return filled ? value : '';
