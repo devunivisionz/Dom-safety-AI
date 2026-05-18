@@ -23,7 +23,7 @@ const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000)
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
 const CAPTURE_SCREENSHOTS = process.env.FORM_CAPTURE_SCREENSHOTS === 'true';
-const SERVICE_VERSION = 'v36-layered-fill';
+const SERVICE_VERSION = 'v37-combo-textarea';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -226,7 +226,7 @@ function stageTimeout(name) {
   if (name === 'choose project site') return 60000;
   if (name === 'fill reporter name') return 18000;
   if (name === 'fill reporter email') return 18000;
-  if (name === 'fill company') return 18000;
+  if (name === 'fill company') return 20000;
   if (name === 'choose contractor observed') return 30000;
   if (name === 'fill contractor observed other') return 15000;
   if (name === 'choose type of observation') return 15000;
@@ -377,7 +377,7 @@ async function fillTextNearLabel(page, labelSubstring, value) {
   if (!value) return '';
   console.log(`[fillText] "${labelSubstring}" => "${value}"`);
   const val = String(value);
-  const FILL_TIMEOUT = 5000;
+  const FILL_TIMEOUT = 2000;
 
   // Helper: attempt a fill on a Playwright locator, return true on success
   async function tryLocator(loc, tag) {
@@ -581,6 +581,152 @@ async function fillFocusedOrVisibleInput(page, value) {
   }
   await page.waitForTimeout(1000);
   return filled;
+}
+
+/**
+ * Generic Airtable combo/select field: click the field container near a label,
+ * type to search, click the matching option.
+ * Used for Company, Contractor Observed, Type of Hazard, and any other select field.
+ */
+async function chooseComboField(page, labelText, value) {
+  if (!value) return '';
+  const target = String(value);
+  console.log(`[chooseCombo] "${labelText}" => "${target}"`);
+
+  await dismissOpenPopover(page);
+
+  // Step 1: find and click the field container to open the dropdown
+  const opened = await page.evaluate((lbl) => {
+    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    const lt = normalize(lbl);
+    const isVisible = (el) => {
+      const s = window.getComputedStyle(el);
+      const b = el.getBoundingClientRect();
+      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
+    };
+    // Find the label element
+    const allText = Array.from(document.querySelectorAll('label, div, span, p')).filter(isVisible);
+    const labelEl = allText
+      .filter((el) => normalize(el.textContent) === lt || normalize(el.textContent).startsWith(lt))
+      .sort((a, b) => a.textContent.length - b.textContent.length)[0];
+    if (!labelEl) return false;
+    // Walk up to find the field container and click it
+    const container = labelEl.closest('[class*="field"], [class*="cell"], section')
+      || labelEl.parentElement?.parentElement
+      || labelEl.parentElement;
+    if (container) {
+      container.scrollIntoView({ block: 'center' });
+      container.click();
+      return true;
+    }
+    labelEl.click();
+    return true;
+  }, labelText);
+
+  if (!opened) {
+    console.warn(`[chooseCombo] could not find label "${labelText}"`);
+    return '';
+  }
+
+  await page.waitForTimeout(800);
+
+  // Step 2: type into search box
+  await fillFocusedOrVisibleInput(page, target);
+
+  // Step 3: click the matching option
+  let clicked = await clickByText(page, target, { exact: true, partial: false, maxLen: 200 });
+  if (!clicked) clicked = await clickByText(page, target, { exact: false, partial: true, maxLen: 200 });
+
+  if (clicked) {
+    await page.waitForTimeout(400);
+    await page.keyboard.press('Escape').catch(() => undefined);
+    console.log(`[chooseCombo] selected "${target}"`);
+    return target;
+  }
+
+  // Fallback: click first visible option
+  const firstOpt = page.locator('[role="option"]').first();
+  if (await firstOpt.isVisible({ timeout: 2000 }).catch(() => false)) {
+    const txt = (await firstOpt.textContent() || '').trim();
+    await firstOpt.click();
+    await page.waitForTimeout(400);
+    await page.keyboard.press('Escape').catch(() => undefined);
+    console.warn(`[chooseCombo] fallback: selected first option "${txt}" for "${labelText}"`);
+    return txt;
+  }
+
+  console.warn(`[chooseCombo] no option found for "${labelText}" value "${target}"`);
+  return '';
+}
+
+/**
+ * Fill a textarea that Airtable renders without a usable label or placeholder.
+ * Strategy: find the label text node, then find the nearest textarea below it.
+ * Falls back to filling by textarea index (0=description, 1=corrective action).
+ */
+async function fillTextareaByLabel(page, labelText, value, fallbackIndex = 0) {
+  if (!value) return '';
+  console.log(`[fillTextarea] "${labelText}" => "${value}" (fallbackIndex=${fallbackIndex})`);
+  const val = String(value);
+
+  const filled = await page.evaluate(({ lbl, nextValue, fbIdx }) => {
+    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+    const isVisible = (el) => {
+      const s = window.getComputedStyle(el);
+      const b = el.getBoundingClientRect();
+      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
+    };
+    const fill = (el) => {
+      el.focus();
+      const proto = el instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) setter.call(el, nextValue); else el.value = nextValue;
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: nextValue }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
+    };
+
+    const allText = Array.from(document.querySelectorAll('label, div, span, p')).filter(isVisible);
+    const lt = normalize(lbl).toLowerCase();
+    const labelEl = allText
+      .filter((el) => normalize(el.textContent).toLowerCase().includes(lt))
+      .sort((a, b) => a.textContent.length - b.textContent.length)[0];
+
+    const textareas = Array.from(document.querySelectorAll(
+      'textarea, [contenteditable="true"], [role="textbox"]',
+    )).filter(isVisible);
+
+    if (labelEl) {
+      const lb = labelEl.getBoundingClientRect();
+      const below = textareas
+        .map((ta) => {
+          const box = ta.getBoundingClientRect();
+          return { ta, dist: box.top - lb.bottom };
+        })
+        .filter((e) => e.dist >= -20 && e.dist <= 300)
+        .sort((a, b) => a.dist - b.dist);
+      if (below[0]) {
+        fill(below[0].ta);
+        return { ok: true, method: 'proximity' };
+      }
+    }
+
+    // Fallback: use index
+    if (textareas[fbIdx]) {
+      fill(textareas[fbIdx]);
+      return { ok: true, method: `index:${fbIdx}` };
+    }
+
+    return { ok: false, count: textareas.length };
+  }, { lbl: labelText, nextValue: val, fbIdx: fallbackIndex });
+
+  if (filled.ok) {
+    console.log(`[fillTextarea] success via ${filled.method}`);
+    return val;
+  }
+  console.warn(`[fillTextarea] failed for "${labelText}", textarea count=${filled.count}`);
+  return '';
 }
 
 async function chooseLinkedProject(page, value) {
@@ -958,10 +1104,11 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     );
     selected.reporter_email = payload.reporter_email;
 
+    // Company is a combo/select field, not a plain text input
     selected.company_name = await stage('fill company', async () => {
       const cv = payload.company_name || FIELD_DEFAULTS.company_name;
-      await fillTextNearLabel(page, 'Name of Company', cv);
-      return cv;
+      const chosen = await chooseComboField(page, 'Name of Company', cv);
+      return chosen || cv;
     });
 
     // FIX: skip Contractor Observed entirely when value is None/unset.
@@ -1013,12 +1160,10 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await stage('fill description', async () => {
       const text = payload.description_of_event;
       if (!text) return;
-      const useOriginal = await isFieldVisible(page, 'Description of Event (original)', 2000);
-      await fillTextNearLabel(
-        page,
-        useOriginal ? 'Description of Event (original)' : 'Description of Event',
-        text,
-      );
+      // Description is an unlabelled textarea — use positional fill (index 0)
+      const result = await fillTextareaByLabel(page, 'Description of Event', text, 0);
+      // If proximity fill failed, try the (original) label variant as a last resort
+      if (!result) await fillTextNearLabel(page, 'Description of Event (original)', text);
       selected.description_of_event = text;
     });
 
@@ -1034,22 +1179,24 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     // Wait for conditional fields to appear in DOM after radio selection
     await page.waitForTimeout(1200);
 
-    // FIX: corrective action filled after followup (may be conditional)
+    // FIX: corrective action is also an unlabelled textarea — use positional fill (index 1)
     await stage('fill corrective action', async () => {
       if (!payload.corrective_action) return;
-      await fillTextNearLabel(page, 'Corrective Action', payload.corrective_action);
+      await fillTextareaByLabel(page, 'Corrective Action', payload.corrective_action, 1);
       selected.corrective_action = payload.corrective_action;
     });
 
     // FIX: days_to_complete is required when followup = 'Follow Up Needed'.
-    // Was never filled in v34, causing validation_error on Airtable's side.
+    // It's a numeric input — try fillTextNearLabel first (it has a real label),
+    // fall back to fillTextareaByLabel proximity.
     await stage('fill days to complete', async () => {
       if (payload.followup_status !== 'Follow Up Needed') {
         selected.days_to_complete = 'skipped:not-required';
         return;
       }
       const days = String(payload.days_to_complete || FIELD_DEFAULTS.days_to_complete);
-      await fillTextNearLabel(page, 'Number of days to complete', days);
+      const r = await fillTextNearLabel(page, 'Number of days to complete', days);
+      if (!r) await fillTextareaByLabel(page, 'Number of days to complete', days, 2);
       selected.days_to_complete = days;
     });
 
