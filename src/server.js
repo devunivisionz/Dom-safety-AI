@@ -22,7 +22,7 @@ const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 9
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
-const SERVICE_VERSION = 'v28-date-fill-and-required-fields';
+const SERVICE_VERSION = 'v29-project-picker-fallback';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -394,6 +394,43 @@ async function clickByText(page, target, { exact = true, partial = false, maxLen
   }, { target, exact, partial, maxLen });
 }
 
+async function fillFocusedOrVisibleInput(page, value) {
+  const filled = await page.evaluate((nextValue) => {
+    const isVisible = (node) => {
+      if (!node) return false;
+      const style = window.getComputedStyle(node);
+      const box = node.getBoundingClientRect();
+      return style.visibility !== 'hidden' && style.display !== 'none' && box.width > 0 && box.height > 0;
+    };
+    const candidates = [];
+    if (document.activeElement instanceof HTMLInputElement && isVisible(document.activeElement)) {
+      candidates.push(document.activeElement);
+    }
+    candidates.push(...Array.from(document.querySelectorAll('input:not([type="hidden"])')).filter(isVisible));
+    const input = candidates.find((candidate) => {
+      const text = [
+        candidate.getAttribute('placeholder'),
+        candidate.getAttribute('aria-label'),
+        candidate.getAttribute('name'),
+        candidate.getAttribute('role'),
+      ].join(' ').toLowerCase();
+      return text.includes('search') || text.includes('find') || text.includes('option');
+    }) || candidates[0];
+    if (!input) return false;
+    input.focus();
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(input, nextValue); else input.value = nextValue;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }, String(value));
+  if (!filled) {
+    await page.keyboard.type(String(value), { delay: 20 }).catch(() => undefined);
+  }
+  await page.waitForTimeout(1000);
+  return filled;
+}
+
 async function chooseLinkedProject(page, value) {
   const target = value || FIELD_DEFAULTS.project_site;
   console.log('[project_site] selecting:', target);
@@ -414,14 +451,7 @@ async function chooseLinkedProject(page, value) {
   await addBtn.click({ force: true, noWaitAfter: true });
   await page.waitForTimeout(1500);
 
-  const searchBox = page.locator(
-    'input[placeholder*="Search"], input[placeholder*="Find"], input[placeholder*="search"]',
-  ).first();
-
-  if (await searchBox.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await searchBox.fill(target, { timeout: 5000 });
-    await page.waitForTimeout(1000);
-  }
+  await fillFocusedOrVisibleInput(page, target);
 
   const clicked = await clickByText(page, target, { exact: true, partial: false, maxLen: 120 })
     || await clickByText(page, target, { exact: false, partial: true, maxLen: 120 });
