@@ -23,7 +23,7 @@ const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000)
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
 const CAPTURE_SCREENSHOTS = process.env.FORM_CAPTURE_SCREENSHOTS === 'true';
-const SERVICE_VERSION = 'v37-combo-textarea';
+const SERVICE_VERSION = 'v37-stabilized-stages';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -233,7 +233,7 @@ function stageTimeout(name) {
   if (name === 'choose type of hazard') return 30000;
   if (name === 'choose positive safe observation') return 30000;
   if (name === 'choose stop work authority') return 15000;
-  if (name === 'fill description') return 15000;
+  if (name === 'fill description') return 25000;
   // FIX: bumped timeout — conditional fields need a moment to render after this
   if (name === 'choose follow-up status') return 20000;
   if (name === 'fill corrective action') return 15000;
@@ -377,7 +377,7 @@ async function fillTextNearLabel(page, labelSubstring, value) {
   if (!value) return '';
   console.log(`[fillText] "${labelSubstring}" => "${value}"`);
   const val = String(value);
-  const FILL_TIMEOUT = 2000;
+  const FILL_TIMEOUT = 5000;
 
   // Helper: attempt a fill on a Playwright locator, return true on success
   async function tryLocator(loc, tag) {
@@ -1157,9 +1157,13 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       clickRadioOption(page, swLabel),
     );
 
+    // FIX: Stabilize page before filling description to prevent browser crash
     await stage('fill description', async () => {
       const text = payload.description_of_event;
       if (!text) return;
+      // Ensure any open popovers/dropdowns are dismissed and page is stable
+      await dismissOpenPopover(page);
+      await page.waitForTimeout(600);
       // Description is an unlabelled textarea — use positional fill (index 0)
       const result = await fillTextareaByLabel(page, 'Description of Event', text, 0);
       // If proximity fill failed, try the (original) label variant as a last resort
