@@ -22,6 +22,7 @@ const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 9
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
+const SERVICE_VERSION = 'v28-date-fill-and-required-fields';
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -259,6 +260,61 @@ async function fillInputByPlaceholderFragment(page, fragment, value) {
   await page.keyboard.press('Escape').catch(() => undefined);
   await page.waitForTimeout(300);
   return value;
+}
+
+async function fillDateTimeNearLabel(page, labelSubstring, dateValue, timeValue) {
+  console.log(`[fillDateTime] "${labelSubstring}" => "${dateValue}" "${timeValue || ''}"`);
+  const filled = await page.evaluate(({ labelText, nextDate, nextTime }) => {
+    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+    const allNodes = Array.from(document.querySelectorAll('div, label, span, p'));
+    const labelNode = allNodes.find((node) => {
+      const s = window.getComputedStyle(node);
+      const b = node.getBoundingClientRect();
+      return s.visibility !== 'hidden' && s.display !== 'none'
+        && b.width > 0 && b.height > 0
+        && normalize(node.textContent).toLowerCase().includes(labelText.toLowerCase());
+    });
+    if (!labelNode) return false;
+
+    const labelBox = labelNode.getBoundingClientRect();
+    const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"])'));
+    const candidates = inputs
+      .filter((input) => {
+        const s = window.getComputedStyle(input);
+        const b = input.getBoundingClientRect();
+        return s.visibility !== 'hidden' && s.display !== 'none'
+          && b.width > 0 && b.height > 0
+          && b.top >= labelBox.top - 8
+          && b.top <= labelBox.top + 260;
+      })
+      .sort((a, b) => {
+        const ab = a.getBoundingClientRect();
+        const bb = b.getBoundingClientRect();
+        return ab.top - bb.top || ab.left - bb.left;
+      });
+
+    const setValue = (input, value) => {
+      if (!input || !value) return false;
+      input.focus();
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (setter) setter.call(input, value); else input.value = value;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new Event('blur', { bubbles: true }));
+      return true;
+    };
+
+    const dateInput = candidates[0];
+    const timeInput = candidates[1];
+    const didDate = setValue(dateInput, String(nextDate));
+    const didTime = nextTime ? setValue(timeInput, String(nextTime)) : true;
+    return didDate && didTime;
+  }, { labelText: labelSubstring, nextDate: String(dateValue), nextTime: timeValue ? String(timeValue) : '' });
+
+  if (!filled) console.warn(`[fillDateTime] unable to fill "${labelSubstring}"`);
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(300);
+  return filled;
 }
 
 async function fillTextNearLabel(page, labelSubstring, value) {
@@ -678,14 +734,14 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
 
     // === REQUIRED FIELDS ===
 
-    await stage('fill date', () =>
-      fillInputByPlaceholderFragment(page, 'mm/dd', airtableDateLabel(payload.date_of_event)),
-    );
-
-    await stage('fill time', async () => {
-      if (!payload.time) return;
+    await stage('fill date', async () => {
       const [h, m] = payload.time.split(':').map(Number);
-      await fillInputByPlaceholderFragment(page, 'hh', airtableTimeLabel(h, m));
+      await fillDateTimeNearLabel(
+        page,
+        'Date of Event',
+        airtableDateLabel(payload.date_of_event),
+        payload.time ? airtableTimeLabel(h, m) : '',
+      );
     });
 
     selected.project_site = await stage('choose project site', () =>
@@ -937,11 +993,11 @@ app.get('/', (req, res) => res.json({
   ok: true,
   service: 'AI Safety Manager Form Service',
   submit_mode: SUBMIT_MODE,
-  version: 'v27-required-fields-only',
+  version: SERVICE_VERSION,
   endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
 }));
 app.get('/health', (req, res) => res.json({
-  ok: true, submit_mode: SUBMIT_MODE, version: 'v27-required-fields-only',
+  ok: true, submit_mode: SUBMIT_MODE, version: SERVICE_VERSION,
 }));
 app.post('/', submitObservationForm);
 app.post('/submit-observation-form', submitObservationForm);
