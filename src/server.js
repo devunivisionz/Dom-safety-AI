@@ -17,10 +17,22 @@ const FORM_URL =
 const TOKEN = process.env.FORM_SERVICE_TOKEN || '';
 const SUBMIT_MODE = process.env.FORM_SUBMIT_MODE || 'live';
 
-const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 15000);
+const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 60000);
 const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 90000);
-const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000);
-const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
+const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 60000);
+const FORM_READY_SELECTOR = 'input:visible, textarea:visible, [role="combobox"]:visible';
+const NAVIGATION_RETRIES = Number(process.env.FORM_NAVIGATION_RETRIES || 3);
+const NAVIGATION_RETRY_DELAY_MS = Number(process.env.FORM_NAVIGATION_RETRY_DELAY_MS || 3000);
+const NAVIGATION_STAGE_TIMEOUT_MS = Number(
+  process.env.FORM_NAVIGATION_STAGE_TIMEOUT_MS
+    || ((NAVIGATION_TIMEOUT_MS + FORM_READY_TIMEOUT_MS + NAVIGATION_RETRY_DELAY_MS)
+      * NAVIGATION_RETRIES)
+    + 5000,
+);
+const REQUEST_TIMEOUT_MS = Number(
+  process.env.FORM_REQUEST_TIMEOUT_MS || NAVIGATION_STAGE_TIMEOUT_MS + 90000,
+);
+const CHROMIUM_LAUNCH_ARGS = buildChromiumLaunchArgs(serverlessChromium.args);
 
 const FIELD_DEFAULTS = {
   project_site: 'Bauxite II (BWI110)',
@@ -124,6 +136,64 @@ function withTimeout(promise, ms, msg) {
   return Promise.race([promise, t]).finally(() => clearTimeout(tid));
 }
 
+function buildChromiumLaunchArgs(baseArgs) {
+  const disableFeaturesPrefix = '--disable-features=';
+  const disableFeatures = [];
+  const launchArgs = [
+    ...baseArgs,
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--disable-background-networking',
+    '--disable-background-timer-throttling',
+    '--disable-renderer-backgrounding',
+    '--disable-features=TranslateUI',
+    '--disable-extensions',
+  ];
+
+  const args = launchArgs.filter((arg) => {
+    if (!arg.startsWith(disableFeaturesPrefix)) return true;
+
+    disableFeatures.push(...arg.slice(disableFeaturesPrefix.length).split(',').filter(Boolean));
+    return false;
+  });
+
+  return Array.from(new Set([
+    ...args,
+    disableFeaturesPrefix + Array.from(new Set(disableFeatures)).join(','),
+  ]));
+}
+
+async function navigateWithRetry(page, url, retries = NAVIGATION_RETRIES) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      console.log(`[navigate] attempt ${attempt}`);
+
+      await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: NAVIGATION_TIMEOUT_MS,
+      });
+
+      await page.waitForSelector(FORM_READY_SELECTOR, {
+        timeout: FORM_READY_TIMEOUT_MS,
+      });
+
+      console.log('[navigate] Airtable form ready');
+      return true;
+    } catch (err) {
+      lastError = err;
+      console.log(`[navigate] attempt ${attempt} failed: ${err.message}`);
+
+      if (attempt < retries) await page.waitForTimeout(NAVIGATION_RETRY_DELAY_MS);
+    }
+  }
+
+  throw new Error(`[navigate Airtable form] Failed after retries: ${lastError.message}`);
+}
+
 function airtableDateLabel(iso) {
   const [y, m, d] = iso.split('-').map(Number);
   return m + '/' + d + '/' + y;
@@ -144,13 +214,13 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
   let stageName = 'initializing';
   let submitOutcome = 'not_attempted';
 
-  const stage = async (name, fn) => {
+  const stage = async (name, fn, timeoutMs = 30000) => {
     stageName = name;
     tracker.stage = name;
     console.log('form-service stage: ' + name);
     return withTimeout(
       Promise.resolve().then(fn),
-      30000,
+      timeoutMs,
       'Timed out during stage "' + name + '"',
     );
   };
@@ -160,7 +230,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       headless: true,
       executablePath: process.env.CHROMIUM_EXECUTABLE_PATH
         || (await serverlessChromium.executablePath()),
-      args: [...serverlessChromium.args, '--no-sandbox', '--disable-setuid-sandbox'],
+      args: CHROMIUM_LAUNCH_ARGS,
     }));
 
     context = await stage('create browser context', () =>
@@ -170,16 +240,20 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     page.setDefaultTimeout(ACTION_TIMEOUT_MS);
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
 
-    // Navigate
     await stage('navigate Airtable form', async () => {
-      await page.goto(FORM_URL, { waitUntil: 'commit', timeout: NAVIGATION_TIMEOUT_MS });
-      await page.waitForLoadState('domcontentloaded', { timeout: NAVIGATION_TIMEOUT_MS })
-        .catch(() => undefined);
-    });
-    
-    await stage('wait for form ready', () =>
-      page.getByText(/Date\s+of\s+event/i).first().waitFor({ timeout: FORM_READY_TIMEOUT_MS }),
-    );
+      try {
+        await navigateWithRetry(page, FORM_URL, NAVIGATION_RETRIES);
+      } catch (err) {
+        const screenshotPath = `/tmp/airtable-navigation-error-${Date.now()}.png`;
+
+        await page.screenshot({
+          path: screenshotPath,
+          fullPage: true,
+        }).catch(() => {});
+
+        throw new Error(`[navigate Airtable form] ${err.message}`);
+      }
+    }, NAVIGATION_STAGE_TIMEOUT_MS);
 
     // Dismiss overlays
     await page.keyboard.press('Escape').catch(() => undefined);
