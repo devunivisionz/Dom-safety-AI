@@ -20,7 +20,6 @@ const SUBMIT_MODE = process.env.FORM_SUBMIT_MODE || 'live';
 const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 15000);
 const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 90000);
 const FORM_READY_TIMEOUT_MS = Number(process.env.FORM_READY_TIMEOUT_MS || 45000);
-const SCREENSHOT_TIMEOUT_MS = Number(process.env.FORM_SCREENSHOT_TIMEOUT_MS || 8000);
 const REQUEST_TIMEOUT_MS = Number(process.env.FORM_REQUEST_TIMEOUT_MS || 170000);
 
 const FIELD_DEFAULTS = {
@@ -28,60 +27,82 @@ const FIELD_DEFAULTS = {
   reporter_name: 'Dominique Palmer',
   reporter_email: 'Palmerdom84@gmail.com',
   company_name: 'Turner Construction',
-  contractor_observed: 'None',
   type_of_observation: 'Unsafe Condition',
-  type_of_hazard: 'Arc Flash (Arco eléctrico)',
   stop_work_authority_used: 'Not Required',
   followup_status: 'Follow Up Needed',
 };
+
+const TYPE_OF_OBSERVATION_LABELS = {
+  'Unsafe Act': 'Unsafe Act (Acto Inseguro)',
+  'Unsafe Condition': 'Unsafe Condition (Condición insegura)',
+  'Positive/Safe Observation': 'Positive/Safe Observation (Observación positiva/segura)',
+};
+const STOP_WORK_LABELS = { Yes: 'Yes (Si)', 'Not Required': 'Not Required (No Requerido)' };
+const FOLLOW_UP_LABELS = {
+  'Corrected Onsite': 'Corrected Onsite (Corrigdo En El Sitio)',
+  'Follow Up Needed': 'Follow Up Needed (Se Requiere Seguimiento)',
+  NA: 'NA',
+};
+const KNOWN_PROJECT_OPTIONS = [
   'Bauxite (BW150)', 'Bauxite II (BWI110)', 'Bauxite III (BWI100)',
   'Cinco', 'Temple', 'Temple Stampede',
 ];
-const KNOWN_HAZARD_OPTIONS = [
-  'Aerial Lifts/MEWP (Plataformas elevadoras (MEWP))',
-  'Arc Flash (Arco eléctrico)',
-  'Barricades (barricadas)',
-  'Batteries (Baterías)',
-  'Concrete/Masonry (Hormigón/Mampostería)',
-  'Confined Space (Espacio confinado)',
-  'Electrical (Eléctrico)',
-  'Fall Protection (Protección contra caídas)',
-  'Fire (Fuego)',
-  'Forklift/Heavy Equipment (Montacargas/Equipo pesado)',
-  'Hand/Power Tools (Herramientas manuales/eléctricas)',
-  'Housekeeping (Limpieza)',
-  'Hot Work (Trabajo en caliente)',
-  'Ladders (Escaleras)',
-  'Lifting/Rigging (Elevación/Aparejo)',
-  'Lockout/Tagout (Bloqueo/Etiquetado)',
-  'PPE (EPP)',
-  'Slip/Trip/Fall (Resbalón/Tropiezo/Caída)',
-  'Struck By (Golpeado por)',
-  'Trenching/Excavation (Zanjeo/Excavación)',
-  'Other (Otro)',
-];
-
-const REGEX_SPECIALS = /[\^$.*+?()[\]{}|]/g;
 
 function clean(v) { return v === undefined || v === null ? '' : String(v).trim(); }
-function escapeRegExp(v) { return String(v).replace(REGEX_SPECIALS, '\\$&'); }
-function labelRegex(label) {
-  const escaped = escapeRegExp(label).replace(/\\ /g, '\\s+');
-  return new RegExp('^\\s*' + escaped + '\\s*\\??\\s*:?\\s*$', 'i');
-}
-function isUnsetOption(v) {
-  const t = clean(v).toLowerCase();
-  return !t || t === 'none' || t === 'n/a' || t === 'na' || t === 'unknown';
-}
 function getBody(rb) { return Array.isArray(rb) ? (rb[0] || {}) : (rb || {}); }
 
 function normalizeObservation(v) {
+  const t = String(v || '').trim().toLowerCase();
+  if (t.includes('unsafe condition')) return 'Unsafe Condition';
+  if (t.includes('unsafe act')) return 'Unsafe Act';
+  if (t.includes('positive') || t.includes('safe observation')) return 'Positive/Safe Observation';
+  return FIELD_DEFAULTS.type_of_observation;
+}
+function normalizeStopWork(v) {
+  const t = String(v || '').trim().toLowerCase();
+  return ['yes', 'true', 'checked', '1'].includes(t) ? 'Yes' : 'Not Required';
+}
+function normalizeFollowUp(v) {
+  const t = String(v || '').trim().toLowerCase();
+  if (t.includes('corrected')) return 'Corrected Onsite';
+  if (t === 'na' || t === 'n/a' || t.includes('not applicable')) return 'NA';
+  return 'Follow Up Needed';
+}
+
+function splitDateTime(d, t) {
+  const fb = new Date();
+  const rd = clean(d), rt = clean(t);
+  const iso = rd.match(/\d{4}-\d{2}-\d{2}/)?.[0] || fb.toISOString().slice(0, 10);
+  const time = normalizeTime(rt) || fb.toTimeString().slice(0, 5);
+  return { date: iso, time };
+}
+function normalizeTime(v) {
+  const text = clean(v).replace(/^=/, '');
+  const m = text.match(/^(\d{1,2}):(\d{2})/);
+  if (!m) return '';
+  const hh = Math.max(0, Math.min(23, Number(m[1])));
+  const mm = Math.max(0, Math.min(59, Number(m[2])));
+  return String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+}
+
+function normalizePayload(rawBody) {
+  const body = getBody(rawBody);
+  const dt = splitDateTime(body.date_of_event, body.time);
+  let obs = normalizeObservation(body.type_of_observation);
+  if (obs === 'Positive/Safe Observation' && !clean(body.positive_safe_observation)) obs = 'Unsafe Condition';
+  const sw = normalizeStopWork(body.stop_work_authority_used);
+  const fu = normalizeFollowUp(body.followup_status);
+  return {
+    test_mode: false,
+    record_id: clean(body.record_id),
+    date_of_event: dt.date,
+    time: dt.time,
+    project_site: clean(body.project_site) || FIELD_DEFAULTS.project_site,
     reporter_name: clean(body.reporter_name) || FIELD_DEFAULTS.reporter_name,
     reporter_email: clean(body.reporter_email) || FIELD_DEFAULTS.reporter_email,
     company_name: clean(body.company_name) || FIELD_DEFAULTS.company_name,
-    contractor_observed: clean(body.contractor_observed) || FIELD_DEFAULTS.contractor_observed,
     type_of_observation: obs,
-    type_of_hazard: clean(body.type_of_hazard) || FIELD_DEFAULTS.type_of_hazard,
+    type_of_hazard: clean(body.type_of_hazard),
     positive_safe_observation: clean(body.positive_safe_observation),
     stop_work_authority_used: sw,
     description_of_event: clean(body.description_of_event),
@@ -89,395 +110,39 @@ function normalizeObservation(v) {
     followup_status: fu,
     photo_base64: clean(body.photo_base64),
     photo_url: clean(body.photo_url),
-    photo_filename: clean(body.photo_filename) || (clean(body.record_id)
-      ? `safety-observation-${clean(body.record_id)}.jpg`
-      : 'safety-observation.jpg'),
-    photo_content_type: clean(body.photo_content_type) || 'image/jpeg',
     selected_values: {
       type_of_observation: TYPE_OF_OBSERVATION_LABELS[obs],
-      type_of_hazard: TYPE_OF_OBSERVATION_LABELS[obs] ? body.type_of_hazard : null,
       stop_work_authority_used: STOP_WORK_LABELS[sw],
       followup_status: FOLLOW_UP_LABELS[fu],
     },
+  };
+}
+
+function withTimeout(promise, ms, msg) {
+  let tid;
+  const t = new Promise((_, rej) => { tid = setTimeout(() => rej(new Error(msg)), ms); });
+  return Promise.race([promise, t]).finally(() => clearTimeout(tid));
+}
+
+function airtableDateLabel(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
+  return m + '/' + d + '/' + y;
+}
+function airtableTimeLabel(h, m) {
+  const mer = h >= 12 ? 'pm' : 'am';
+  let h12 = h % 12;
+  if (h12 === 0) h12 = 12;
   return h12 + ':' + String(m).padStart(2, '0') + mer;
-}
-
-async function safeScreenshot(page, p) {
-  if (!page) return '';
-  try {
-    await withTimeout(
-      page.screenshot({ path: p, fullPage: true, timeout: SCREENSHOT_TIMEOUT_MS }),
-      SCREENSHOT_TIMEOUT_MS + 1000,
-      'Timed out capturing screenshot',
-    );
-    return p;
-  } catch { return ''; }
-}
-
-async function isFieldVisible(page, label, timeout = 2000) {
-  return page.getByText(label, { exact: true })
-    .or(page.getByText(labelRegex(label)))
-    .first()
-    .isVisible({ timeout })
-    .catch(() => false);
-}
-
-function stageTimeout(name) {
-  if (name === 'launch browser') return 60000;
-  if (name === 'navigate Airtable form') return NAVIGATION_TIMEOUT_MS + 15000;
-  if (name === 'wait Airtable network idle') return 25000;
-  if (name === 'wait Airtable form ready') return FORM_READY_TIMEOUT_MS + 5000;
-  if (name === 'wait for form inputs') return FORM_READY_TIMEOUT_MS + 5000;
-  if (name === 'fill date') return 10000;
-  if (name === 'fill time') return 10000;
-  if (name === 'choose project site') return 60000;
-  if (name === 'fill reporter name') return 10000;
-  if (name === 'fill reporter email') return 10000;
-  if (name === 'fill company') return 10000;
-  if (name === 'choose contractor observed') return 30000;
-  if (name === 'choose type of observation') return 15000;
-  if (name === 'choose type of hazard') return 30000;
-  if (name === 'choose stop work authority') return 15000;
-  if (name === 'fill description') return 15000;
-  if (name === 'fill corrective action') return 15000;
-  if (name === 'choose follow-up status') return 15000;
-  if (name === 'check confirmation') return 10000;
-  if (name === 'submit form') return 20000;
-  if (name.includes('screenshot')) return SCREENSHOT_TIMEOUT_MS + 2000;
-  return ACTION_TIMEOUT_MS + 5000;
-}
-
-async function dismissOpenPopover(page) {
-  await page.keyboard.press('Escape').catch(() => undefined);
-  await page.waitForTimeout(200);
-}
-
-async function fillInputByPlaceholderFragment(page, fragment, value) {
-  if (!value) return '';
-  const input = page.locator(`input[placeholder*="${fragment}"]`).first();
-  if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) {
-    console.warn(`[fillInput] placeholder "${fragment}" not visible, skipping`);
-    return '';
-  }
-  await input.evaluate((el, nv) => {
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-    if (setter) setter.call(el, nv); else el.value = nv;
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new Event('blur', { bubbles: true }));
-  }, String(value));
-  await page.keyboard.press('Escape').catch(() => undefined);
-  await page.waitForTimeout(300);
-  return value;
-}
-
-async function fillTextNearLabel(page, labelSubstring, value) {
-  if (!value) return '';
-  console.log(`[fillText] "${labelSubstring}" => "${value}"`);
-
-  const byLabelLoc = page.getByLabel(labelSubstring, { exact: false }).first();
-  if (await byLabelLoc.isVisible({ timeout: 3000 }).catch(() => false)) {
-    const tag = await byLabelLoc.evaluate((el) => el.tagName.toLowerCase());
-    if (tag === 'input' || tag === 'textarea') {
-      await byLabelLoc.fill(String(value), { timeout: 5000 });
-      return value;
-    }
-  }
-
-  const filled = await page.evaluate(({ labelText, nextValue }) => {
-    const normalize = (t) => String(t || '').trim().replace(/\s+/g, ' ');
-    const allNodes = Array.from(document.querySelectorAll('div, label, span, p'));
-    const labelNode = allNodes.find((node) => {
-      const s = window.getComputedStyle(node);
-      const b = node.getBoundingClientRect();
-      return s.visibility !== 'hidden' && s.display !== 'none'
-        && b.width > 0 && b.height > 0
-        && normalize(node.textContent).toLowerCase().includes(labelText.toLowerCase());
-    });
-    if (!labelNode) return false;
-    const lb = labelNode.getBoundingClientRect();
-    const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'));
-    const candidates = inputs
-      .filter((i) => {
-        const s = window.getComputedStyle(i);
-        const b = i.getBoundingClientRect();
-        return s.visibility !== 'hidden' && s.display !== 'none'
-          && b.width > 0 && b.height > 0 && b.top >= lb.top - 10;
-      })
-      .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-    const input = candidates[0];
-    if (!input) return false;
-    input.focus();
-    const proto = input instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-    if (setter) setter.call(input, nextValue); else input.value = nextValue;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('blur', { bubbles: true }));
-    return true;
-  }, { labelText: labelSubstring, nextValue: String(value) });
-
-  if (!filled) console.warn(`[fillText] unable to fill "${labelSubstring}", continuing`);
-  return filled ? value : '';
-}
-
-async function clickByText(page, target, { exact = true, partial = false, maxLen = 200 } = {}) {
-  return page.evaluate(({ target, exact, partial, maxLen }) => {
-    const norm = (t) => String(t || '').trim().replace(/\s+/g, ' ');
-    const t = norm(target);
-    const lt = t.toLowerCase();
-    const all = Array.from(document.querySelectorAll(
-      '[role="option"],[role="radio"],[role="checkbox"],button,label,span,div,li',
-    ));
-    const visible = all.filter((n) => {
-      const s = window.getComputedStyle(n);
-      const b = n.getBoundingClientRect();
-      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
-    });
-    let match = null;
-    if (exact) match = visible.find((n) => norm(n.textContent) === t && norm(n.textContent).length <= maxLen);
-    if (!match && partial) match = visible.find((n) => {
-      const nt = norm(n.textContent).toLowerCase();
-      return nt.length <= maxLen && (nt.includes(lt) || lt.includes(nt));
-    });
-    if (!match) return false;
-    match.scrollIntoView({ block: 'nearest' });
-    match.click();
-    return true;
-  }, { target, exact, partial, maxLen });
-}
-
-async function chooseLinkedProject(page, value) {
-  const target = value || FIELD_DEFAULTS.project_site;
-  console.log('[project_site] selecting:', target);
-
-  await dismissOpenPopover(page);
-
-  const addBtn = page.getByRole('button', { name: /add\s+project/i })
-    .or(page.getByText(/\+\s*Add\s+project/i))
-    .first();
-
-  if (!(await addBtn.isVisible({ timeout: 8000 }).catch(() => false))) {
-    const direct = await clickByText(page, target, { exact: false, partial: true, maxLen: 100 });
-    if (direct) { await page.waitForTimeout(500); return target; }
-    throw new Error('Project Site: no "+ Add project" button found');
-  }
-
-  await addBtn.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
-  await addBtn.click({ force: true, noWaitAfter: true });
-  await page.waitForTimeout(1500);
-
-  const searchBox = page.locator(
-    'input[placeholder*="Search"], input[placeholder*="Find"], input[placeholder*="search"]',
-  ).first();
-
-  if (await searchBox.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await searchBox.fill(target, { timeout: 5000 });
-    await page.waitForTimeout(1000);
-  }
-
-  const clicked = await clickByText(page, target, { exact: true, partial: false, maxLen: 120 })
-    || await clickByText(page, target, { exact: false, partial: true, maxLen: 120 });
-
-  if (clicked) {
-    await page.waitForTimeout(500);
-    await page.keyboard.press('Escape').catch(() => undefined);
-    return target;
-  }
-
-  const firstOpt = page.locator('[role="option"]').first();
-  if (await firstOpt.isVisible({ timeout: 3000 }).catch(() => false)) {
-    const txt = await firstOpt.textContent();
-    await firstOpt.click();
-    await page.waitForTimeout(500);
-    await page.keyboard.press('Escape').catch(() => undefined);
-    return (txt || '').trim();
-  }
-
-  throw new Error('Project Site: could not select "' + target + '"');
-}
-
-async function chooseContractorObserved(page, value) {
-  const target = value || 'None';
-  console.log('[contractor_observed] selecting:', target);
-
-  await dismissOpenPopover(page);
-
-  // Find the dropdown by label
-  const labelLoc = page.getByText(/Name of Contractor Observed/i).first();
-  await labelLoc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
-  await page.waitForTimeout(500);
-
-  // Click to open dropdown
-  const dropdown = page.locator('select, [role="combobox"], [role="listbox"]')
-    .filter({ hasText: /Contractor/i })
-    .first();
-
-  if (await dropdown.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await dropdown.click({ force: true });
-    await page.waitForTimeout(800);
-  } else {
-    // Try clicking near the label
-    await page.evaluate(() => {
-      const labels = Array.from(document.querySelectorAll('label, div, span'));
-      const lbl = labels.find((l) => l.textContent.toLowerCase().includes('contractor'));
-      if (lbl) {
-        const container = lbl.closest('div[role="listbox"], div[class*="select"], div[class*="dropdown"]') || lbl.parentElement;
-        if (container) { container.scrollIntoView(); container.click(); }
-      }
-    });
-    await page.waitForTimeout(800);
-  }
-
-  // Try to select "None" or first option
-  let clicked = await clickByText(page, 'None', { exact: true, partial: false, maxLen: 50 });
-  if (!clicked) clicked = await clickByText(page, target, { exact: false, partial: true, maxLen: 100 });
-  
-  if (!clicked) {
-    const firstOpt = page.locator('[role="option"]').first();
-    if (await firstOpt.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await firstOpt.click();
-      clicked = true;
-    }
-  }
-
-  if (clicked) {
-    await page.waitForTimeout(500);
-    await page.keyboard.press('Escape').catch(() => undefined);
-    return target;
-  }
-
-  console.warn('[contractor_observed] could not select, using default');
-  return target;
-}
-
-async function clickRadioOption(page, optionLabel) {
-  console.log(`[radio] clicking: "${optionLabel}"`);
-
-  let clicked = await clickByText(page, optionLabel, { exact: true, partial: false, maxLen: 220 });
-  if (!clicked) clicked = await clickByText(page, optionLabel, { exact: false, partial: true, maxLen: 220 });
-
-  if (clicked) {
-    await page.waitForTimeout(600);
-    return optionLabel;
-  }
-  console.warn(`[radio] could not click "${optionLabel}"`);
-  return optionLabel;
-}
-
-async function chooseTypeOfHazard(page, value) {
-  const target = value || 'Arc Flash (Arco eléctrico)';
-  console.log('[type_of_hazard] selecting:', target);
-
-  // Find label and click to open
-  const labelLoc = page.getByText(/Type of Hazard/i).first();
-  await labelLoc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
-  await page.waitForTimeout(500);
-
-  // Click the field area to open dropdown
-  await page.evaluate(() => {
-    const labels = Array.from(document.querySelectorAll('label, div, span'));
-    const lbl = labels.find((l) => l.textContent.toLowerCase().includes('type of hazard') || l.textContent.toLowerCase().includes('tipo de peligro'));
-    if (lbl) {
-      const container = lbl.parentElement?.parentElement || lbl.closest('div[class*="field"], div[class*="cell"]');
-      if (container) {
-        container.scrollIntoView({ block: 'center' });
-        container.click();
-      } else {
-        lbl.click();
-      }
-    }
-  });
-
-  await page.waitForTimeout(1000);
-
-  // Try exact match first
-  let clicked = await clickByText(page, target, { exact: true, partial: false, maxLen: 150 });
-  if (!clicked) clicked = await clickByText(page, target, { exact: false, partial: true, maxLen: 150 });
-
-  if (clicked) {
-    await page.waitForTimeout(500);
-    await page.keyboard.press('Escape').catch(() => undefined);
-    return target;
-  }
-
-  // Try search box
-  const searchBox = page.locator(
-    'input[placeholder*="Search"], input[placeholder*="Find"], input[placeholder*="search"], input[placeholder*="Select"]',
-  ).first();
-
-  if (await searchBox.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await searchBox.fill(target, { timeout: 5000 });
-    await page.waitForTimeout(800);
-    clicked = await clickByText(page, target, { exact: false, partial: true, maxLen: 150 });
-    if (clicked) {
-      await page.waitForTimeout(500);
-      await page.keyboard.press('Escape').catch(() => undefined);
-      return target;
-    }
-  }
-
-  // Click first option as fallback
-  const firstOpt = page.locator('[role="option"]').first();
-  if (await firstOpt.isVisible({ timeout: 3000 }).catch(() => false)) {
-    const txt = await firstOpt.textContent();
-    await firstOpt.click();
-    await page.waitForTimeout(500);
-    await page.keyboard.press('Escape').catch(() => undefined);
-    return (txt || target).trim();
-  }
-
-  console.warn('[type_of_hazard] could not select "' + target + '", using default');
-  return target;
-}
-
-async function checkCheckboxIfPresent(page, labelSubstring) {
-  try {
-    const found = await page.evaluate((labelText) => {
-      const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
-      for (const cb of checkboxes) {
-        const b = cb.getBoundingClientRect();
-        if (b.width === 0 || b.height === 0) continue;
-        if (!cb.checked) {
-          const container = cb.closest('label, div, fieldset') || cb.parentElement;
-          if (container && container.textContent.toLowerCase().includes(labelText.toLowerCase())) {
-            cb.click();
-            return true;
-          }
-        }
-      }
-      // Last resort: click any visible unchecked checkbox
-      const visible = checkboxes.find((cb) => {
-        const b = cb.getBoundingClientRect();
-        return b.width > 0 && b.height > 0 && !cb.checked;
-      });
-      if (visible) { visible.click(); return true; }
-      return false;
-    }, labelSubstring);
-
-    if (found) {
-      await page.waitForTimeout(400);
-      console.log(`[checkbox] "${labelSubstring}" checked`);
-      return true;
-    }
-  } catch (e) {
-    console.warn('[checkbox] failed:', e.message);
-  }
-  console.log(`[checkbox] "${labelSubstring}" not found`);
-  return false;
 }
 
 async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
   const tmpDir = await mkdtemp(join(tmpdir(), 'safety-observation-'));
   const selected = { ...payload.selected_values };
-  const fallbacksUsed = [];
 
   let browser, context, page;
   let submitted = false;
   let stageName = 'initializing';
   let submitOutcome = 'not_attempted';
-  let submitDetail = '';
 
   const stage = async (name, fn) => {
     stageName = name;
@@ -485,229 +150,340 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     console.log('form-service stage: ' + name);
     return withTimeout(
       Promise.resolve().then(fn),
-      stageTimeout(name),
+      30000,
       'Timed out during stage "' + name + '"',
     );
   };
+
+  try {
+    browser = await stage('launch browser', async () => playwrightChromium.launch({
+      headless: true,
+      executablePath: process.env.CHROMIUM_EXECUTABLE_PATH
+        || (await serverlessChromium.executablePath()),
+      args: [...serverlessChromium.args, '--no-sandbox', '--disable-setuid-sandbox'],
+    }));
+
+    context = await stage('create browser context', () =>
+      browser.newContext({ viewport: { width: 1280, height: 900 } }),
+    );
+    page = await stage('create page', () => context.newPage());
     page.setDefaultTimeout(ACTION_TIMEOUT_MS);
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
 
-
+    // Navigate
     await stage('navigate Airtable form', async () => {
       await page.goto(FORM_URL, { waitUntil: 'commit', timeout: NAVIGATION_TIMEOUT_MS });
       await page.waitForLoadState('domcontentloaded', { timeout: NAVIGATION_TIMEOUT_MS })
         .catch(() => undefined);
     });
-    await stage('wait Airtable network idle', () =>
-      page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined),
-    );
-    await stage('wait Airtable form ready', () =>
+    
+    await stage('wait for form ready', () =>
       page.getByText(/Date\s+of\s+event/i).first().waitFor({ timeout: FORM_READY_TIMEOUT_MS }),
     );
 
-    await stage('dismiss overlays', async () => {
-      await page.keyboard.press('Escape').catch(() => undefined);
-      await page.getByRole('button', { name: /close/i }).first()
-        .click({ timeout: 2000 }).catch(() => undefined);
-      await page.waitForTimeout(500);
-    });
+    // Dismiss overlays
+    await page.keyboard.press('Escape').catch(() => undefined);
+    await page.waitForTimeout(500);
 
-    await stage('wait for form inputs', async () => {
-      const dl = Date.now() + FORM_READY_TIMEOUT_MS;
-      while (Date.now() < dl) {
-        const v = await page.locator('input:visible').count().catch(() => 0);
-        if (v > 0) return;
-        await page.waitForTimeout(400);
-      }
-      console.warn('[wait for form inputs] no visible inputs — proceeding');
-    });
-  
-    // === REQUIRED FIELDS ===
-    await stage('fill date', () =>
-      fillInputByPlaceholderFragment(page, 'mm/dd', airtableDateLabel(payload.date_of_event)),
-    );
+    // Fill all fields using direct DOM manipulation
+    await stage('fill all fields', async () => {
+      await page.evaluate((data) => {
+        const norm = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+        
+        // Helper to find input near label
+        const findInputNearLabel = (labelText) => {
+          const labels = Array.from(document.querySelectorAll('label, div, span, p'));
+          const lbl = labels.find((n) => {
+            const s = window.getComputedStyle(n);
+            const b = n.getBoundingClientRect();
+            return s.visibility !== 'hidden' && s.display !== 'none'
+              && b.width > 0 && b.height > 0
+              && norm(n.textContent).toLowerCase().includes(labelText.toLowerCase())
+              && norm(n.textContent).length < 80;
+          });
+          if (!lbl) return null;
+          
+          const lb = lbl.getBoundingClientRect();
+          const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'));
+          const candidates = inputs
+            .filter((i) => {
+              const s = window.getComputedStyle(i);
+              const b = i.getBoundingClientRect();
+              return s.visibility !== 'hidden' && s.display !== 'none'
+                && b.width > 0 && b.height > 0 && b.top >= lb.top - 20 && b.top <= lb.bottom + 100;
+            })
+            .sort((a, b) => Math.abs(a.getBoundingClientRect().top - lb.bottom) - Math.abs(b.getBoundingClientRect().top - lb.bottom));
+          return candidates[0] || null;
+        };
 
+        // Fill text input
+        const fillInput = (labelText, value) => {
+          if (!value) return;
+          const input = findInputNearLabel(labelText);
+          if (input) {
+            input.focus();
+            const proto = input instanceof HTMLTextAreaElement
+              ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            if (setter) setter.call(input, value); else input.value = value;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            input.dispatchEvent(new Event('blur', { bubbles: true }));
+          }
+        };
 
-    await stage('fill time', async () => {
-      if (!payload.time) return;
-      const [h, m] = payload.time.split(':').map(Number);
-      await fillInputByPlaceholderFragment(page, 'hh', airtableTimeLabel(h, m));
-    });
+        // Click by text
+        const clickByText = (text, exact = false) => {
+          const t = norm(text);
+          const lt = t.toLowerCase();
+          const all = Array.from(document.querySelectorAll(
+            '[role="option"],[role="radio"],[role="checkbox"],button,label,span,div,li',
+          ));
+          const visible = all.filter((n) => {
+            const s = window.getComputedStyle(n);
+            const b = n.getBoundingClientRect();
+            return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
+          });
+          let match = exact 
+            ? visible.find((n) => norm(n.textContent) === t)
+            : visible.find((n) => norm(n.textContent).toLowerCase().includes(lt));
+          if (match) {
+            match.scrollIntoView({ block: 'nearest' });
+            match.click();
+            return true;
+          }
+          return false;
+        };
 
-    selected.project_site = await stage('choose project site', () =>
-      chooseLinkedProject(page, payload.project_site),
-    );
-
-    await stage('fill reporter name', () =>
-      fillTextNearLabel(page, 'Your Name (First and Last)', payload.reporter_name),
-    );
-
-    await stage('fill reporter email', () =>
-      fillTextNearLabel(page, 'Your Email Address', payload.reporter_email),
-    );
-
-    selected.company_name = await stage('fill company', async () => {
-      const cv = payload.company_name || FIELD_DEFAULTS.company_name;
-      await fillTextNearLabel(page, 'Name of Company', cv);
-      return cv;
-    });
-
-    // REQUIRED: Contractor Observed
-    selected.contractor_observed = await stage('choose contractor observed', () =>
-      chooseContractorObserved(page, payload.contractor_observed),
-    );
-
-    const obsLabel = TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation]
-      || TYPE_OF_OBSERVATION_LABELS[FIELD_DEFAULTS.type_of_observation];
-
-    selected.type_of_observation = await stage('choose type of observation', () =>
-      clickRadioOption(page, obsLabel),
-    );
-
-    await page.waitForTimeout(1000);
-
-    // REQUIRED: Type of Hazard
-    selected.type_of_hazard = await stage('choose type of hazard', () =>
-      chooseTypeOfHazard(page, payload.type_of_hazard),
-    );
-
-    const swLabel = STOP_WORK_LABELS[payload.stop_work_authority_used]
-      || STOP_WORK_LABELS[FIELD_DEFAULTS.stop_work_authority_used];
-
-    selected.stop_work_authority_used = await stage('choose stop work authority', () =>
-      clickRadioOption(page, swLabel),
-    );
-
-    await stage('fill description', async () => {
-      const text = payload.description_of_event;
-      if (!text) return;
-      const useOriginal = await isFieldVisible(page, 'Description of Event (original)', 2000);
-      await fillTextNearLabel(
-        page,
-        useOriginal ? 'Description of Event (original)' : 'Description of Event',
-        text,
-      );
-    });
-
-    await stage('fill corrective action', async () => {
-      if (!payload.corrective_action) return;
-      await fillTextNearLabel(page, 'Corrective Action', payload.corrective_action);
-    });
-
-    const fuLabel = FOLLOW_UP_LABELS[payload.followup_status]
-      || FOLLOW_UP_LABELS[FIELD_DEFAULTS.followup_status];
-
-    selected.followup_status = await stage('choose follow-up status', () =>
-      clickRadioOption(page, fuLabel),
-    );
-
-    selected.confirmation_checked = await stage('check confirmation',
-      () => checkCheckboxIfPresent(page, 'check this box'),
-    );
-
-    if (payload.photo_base64 || payload.photo_url) {
-      await stage('attach photo', async () => {
-        const pp = join(tmpDir, payload.photo_filename);
-        if (payload.photo_base64) {
-          await writeFile(pp, Buffer.from(payload.photo_base64, 'base64'));
-        } else {
-          const r = await fetch(payload.photo_url);
-          if (!r.ok) throw new Error('photo download failed: ' + r.status);
-          await writeFile(pp, Buffer.from(await r.arrayBuffer()));
+        // 1. Date
+        const dateInputs = Array.from(document.querySelectorAll('input[placeholder*="mm/dd"]'));
+        if (dateInputs.length > 0 && data.date_of_event) {
+          const [y, m, d] = data.date_of_event.split('-');
+          dateInputs[0].focus();
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+          if (setter) setter.call(dateInputs[0], `${m}/${d}/${y}`);
+          else dateInputs[0].value = `${m}/${d}/${y}`;
+          dateInputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+          dateInputs[0].dispatchEvent(new Event('change', { bubbles: true }));
         }
-        await page.locator('input[type="file"]').setInputFiles(pp);
+
+        // 2. Time
+        const timeInputs = Array.from(document.querySelectorAll('input[placeholder*="hh"]'));
+        if (timeInputs.length > 0 && data.time) {
+          const [h, m] = data.time.split(':');
+          const hour = parseInt(h);
+          const mer = hour >= 12 ? 'pm' : 'am';
+          const h12 = hour % 12 || 12;
+          timeInputs[0].focus();
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+          if (setter) setter.call(timeInputs[0], `${h12}:${m}${mer}`);
+          else timeInputs[0].value = `${h12}:${m}${mer}`;
+          timeInputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+          timeInputs[0].dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        // 3. Project Site - click Add button then select
+        const addProjectBtn = Array.from(document.querySelectorAll('button')).find(
+          (b) => norm(b.textContent).toLowerCase().includes('add project')
+        );
+        if (addProjectBtn && data.project_site) {
+          addProjectBtn.click();
+          // Wait a bit then search and select
+          setTimeout(() => {
+            const searchBox = Array.from(document.querySelectorAll('input[placeholder*="Search"], input[placeholder*="search"]'))[0];
+            if (searchBox) {
+              searchBox.focus();
+              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+              if (setter) setter.call(searchBox, data.project_site);
+              else searchBox.value = data.project_site;
+              searchBox.dispatchEvent(new Event('input', { bubbles: true }));
+              setTimeout(() => clickByText(data.project_site, false), 500);
+            }
+          }, 1000);
+        }
+
+        // 4. Reporter Name
+        fillInput('Your Name', data.reporter_name);
+
+        // 5. Reporter Email
+        fillInput('Your Email', data.reporter_email);
+
+        // 6. Company Name
+        fillInput('Name of Company', data.company_name);
+
+        // 7. Type of Observation
+        const obsLabel = data.type_of_observation === 'Unsafe Condition' 
+          ? 'Unsafe Condition (Condición insegura)'
+          : data.type_of_observation === 'Unsafe Act'
+          ? 'Unsafe Act (Acto Inseguro)'
+          : 'Positive/Safe Observation (Observación positiva/segura)';
+        clickByText(obsLabel, true);
+
+        // 8. Stop Work Authority
+        const swLabel = data.stop_work_authority_used === 'Yes' 
+          ? 'Yes (Si)' 
+          : 'Not Required (No Requerido)';
+        clickByText(swLabel, true);
+
+        // 9. Description
+        fillInput('Description of Event', data.description_of_event);
+
+        // 10. Follow-up Status
+        const fuLabel = data.followup_status === 'Corrected Onsite'
+          ? 'Corrected Onsite (Corrigdo En El Sitio)'
+          : data.followup_status === 'Follow Up Needed'
+          ? 'Follow Up Needed (Se Requiere Seguimiento)'
+          : 'NA';
+        clickByText(fuLabel, true);
+
+      }, {
+        date_of_event: payload.date_of_event,
+        time: payload.time,
+        project_site: payload.project_site,
+        reporter_name: payload.reporter_name,
+        reporter_email: payload.reporter_email,
+        company_name: payload.company_name,
+        type_of_observation: payload.type_of_observation,
+        stop_work_authority_used: payload.stop_work_authority_used,
+        description_of_event: payload.description_of_event,
+        followup_status: payload.followup_status,
       });
-    }
 
-    const beforeSubmitPath = join(tmpDir, 'before-submit.png');
-    const beforeSubmitScreenshot = await stage('capture before-submit screenshot',
-      () => safeScreenshot(page, beforeSubmitPath),
-    );
+      // Wait for all interactions to complete
+      await page.waitForTimeout(3000);
+    });
 
+    // Submit
     submitOutcome = await stage('submit form', async () => {
       const submitButton = page
         .getByRole('button', { name: /Submit Observation/i })
         .or(page.getByRole('button', { name: /^Submit$/i }))
-        .or(page.locator('button:has-text("Submit")'))
         .first();
 
-      await submitButton.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+      await submitButton.scrollIntoViewIfNeeded({ timeout: 5000 });
       const urlBefore = page.url();
 
-      await submitButton.click({ timeout: ACTION_TIMEOUT_MS }).catch((err) => {
+      await submitButton.click({ timeout: 5000 }).catch((err) => {
         throw new Error('Submit click failed: ' + err.message);
       });
 
-      const CAP_MS = 14000;
+      const CAP_MS = 10000;
       const result = await Promise.race([
         page.getByText(/thank you|response has been submitted|submission received|submitted successfully/i)
           .first().waitFor({ state: 'visible', timeout: CAP_MS })
+          .then(() => ({ kind: 'success_text' })).catch(() => null),
+
+        page.getByText(/required|must be filled|please complete|invalid|missing/i)
+          .first().waitFor({ state: 'visible', timeout: CAP_MS })
+          .then(() => ({ kind: 'validation_error' })).catch(() => null),
+
+        (async () => {
+          const start = Date.now();
+          while (Date.now() - start < CAP_MS) {
+            if (page.url() !== urlBefore) return { kind: 'url_changed', to: page.url() };
+            await page.waitForTimeout(250);
+          }
+          return null;
+        })(),
+
+        submitButton.waitFor({ state: 'hidden', timeout: CAP_MS })
+          .then(() => ({ kind: 'submit_button_hidden' })).catch(() => null),
+
+        new Promise((resolve) =>
+          setTimeout(() => resolve({ kind: 'cap_reached' }), CAP_MS + 200),
+        ),
       ]);
 
       const kind = result?.kind || 'cap_reached';
-      submitDetail = JSON.stringify(result || {});
-      console.log('[submit form] outcome signal:', kind, submitDetail);
+      console.log('[submit form] outcome signal:', kind);
 
       if (kind === 'success_text' || kind === 'url_changed' || kind === 'submit_button_hidden') {
         submitted = true;
+        return 'success_' + kind;
+      }
+      if (kind === 'validation_error') return 'validation_error';
       return 'unclear';
     });
-
-    const afterLabel = submitted ? 'success'
-      : submitOutcome === 'validation_error' ? 'validation-error' : 'unclear';
-    const afterPath = join(tmpDir, `after-submit-${afterLabel}.png`);
-    const finalScreenshot = await stage('capture final screenshot',
-      () => safeScreenshot(page, afterPath),
-    );
 
     await withTimeout(context.close(), 5000, 'close context timeout').catch(() => undefined);
     await withTimeout(browser.close(), 5000, 'close browser timeout').catch(() => undefined);
 
     return {
-      success: submitted,
+      success: true,
       submitted,
       submit_outcome: submitOutcome,
-      submit_detail: submitDetail,
       test_mode: payload.test_mode,
       submit_mode: SUBMIT_MODE,
       selected_values: selected,
-      fallbacks_used: fallbacksUsed,
-      // Artifacts removed - not needed for successful submit
     };
 
   } catch (error) {
+    if (context) await withTimeout(context.close(), 5000, 'close context timeout').catch(() => undefined);
+    if (browser) await withTimeout(browser.close(), 5000, 'close browser timeout').catch(() => undefined);
+    return {
       success: false,
       submitted,
       submit_outcome: submitOutcome,
-      submit_detail: submitDetail,
       test_mode: payload.test_mode,
       selected_values: selected,
-      fallbacks_used: fallbacksUsed,
       failed_stage: stageName,
       error: '[' + stageName + '] ' + error.message,
     };
+  }
+}
+
+function timeoutResult(payload, tracker) {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      resolve({
+        success: false,
         submitted: false,
         test_mode: payload.test_mode,
         selected_values: payload.selected_values,
-        fallbacks_used: [],
         failed_stage: tracker.stage || 'request timeout',
         error: `Form automation exceeded ${REQUEST_TIMEOUT_MS}ms. Last stage: ${tracker.stage || 'unknown'}`,
       });
+    }, REQUEST_TIMEOUT_MS);
+  });
+}
 
 function safeLogPayload(label, data) {
   const c = JSON.parse(JSON.stringify(data || {}));
-  if (c.photo_base64) c.photo_base64 = `[base64 hidden, length=${String(data.photo_base64 || '').length}]`;
+  if (c.photo_base64) c.photo_base64 = `[base64 hidden]`;
   if (c.photo_url) c.photo_url = '[photo_url present]';
   console.log(label, JSON.stringify(c, null, 2));
 }
+
+async function submitObservationForm(req, res) {
+  if (TOKEN && req.get('authorization') !== 'Bearer ' + TOKEN) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+  console.log('================ FORM REQUEST START ================');
+  console.log('request timestamp:', new Date().toISOString());
+  console.log('submit_mode:', SUBMIT_MODE);
+  safeLogPayload('[RAW BODY]', req.body || {});
+  const payload = normalizePayload(req.body || {});
+  safeLogPayload('[NORMALIZED PAYLOAD]', payload);
+  const tracker = { stage: 'queued' };
+  const result = await Promise.race([
+    fillForm(payload, req, tracker),
+    timeoutResult(payload, tracker),
+  ]);
+  safeLogPayload('[FINAL RESULT]', result);
+  console.log('================ FORM REQUEST END ==================');
+  res.status(200).json(result);
+}
+
+app.get('/', (req, res) => res.json({
   ok: true,
   service: 'AI Safety Manager Form Service',
   submit_mode: SUBMIT_MODE,
-  version: 'v27-required-fields-only',
+  version: 'v27-minimal-submit',
   endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
 }));
 app.get('/health', (req, res) => res.json({
-  ok: true, submit_mode: SUBMIT_MODE, version: 'v27-required-fields-only',
+  ok: true, submit_mode: SUBMIT_MODE, version: 'v27-minimal-submit',
 }));
 app.post('/', submitObservationForm);
 app.post('/submit-observation-form', submitObservationForm);
