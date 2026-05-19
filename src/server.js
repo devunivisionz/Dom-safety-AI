@@ -30,6 +30,7 @@ const NAVIGATION_STAGE_TIMEOUT_MS = Number(
       * NAVIGATION_RETRIES)
     + 5000,
 );
+const SUBMIT_STAGE_TIMEOUT_MS = Number(process.env.FORM_SUBMIT_STAGE_TIMEOUT_MS || 60000);
 const REQUEST_TIMEOUT_MS = Number(
   process.env.FORM_REQUEST_TIMEOUT_MS || NAVIGATION_STAGE_TIMEOUT_MS + 90000,
 );
@@ -281,6 +282,76 @@ async function navigateWithRetry(page, url, retries = NAVIGATION_RETRIES) {
   }
 
   throw new Error(`[navigate Airtable form] Failed after retries: ${lastError.message}`);
+}
+
+async function clickSubmitButton(page) {
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(500);
+  await page.evaluate(() => {
+    window.scrollTo(0, document.documentElement.scrollHeight);
+  }).catch(() => undefined);
+  await page.waitForTimeout(1000);
+
+  const locators = [
+    page.getByRole('button', { name: /submit observation|submit/i }).last(),
+    page.locator('button:visible').filter({ hasText: /submit/i }).last(),
+    page.locator('[role="button"]:visible').filter({ hasText: /submit/i }).last(),
+    page.locator('input[type="submit"]:visible').last(),
+  ];
+
+  let lastError;
+  for (const locator of locators) {
+    try {
+      await locator.waitFor({ state: 'visible', timeout: 5000 });
+      await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
+      await locator.click({ timeout: 10000 });
+      return locator;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  const domResult = await page.evaluate(() => {
+    const norm = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+    const isVisible = (n) => {
+      if (!n || !(n instanceof Element)) return false;
+      const s = window.getComputedStyle(n);
+      const b = n.getBoundingClientRect();
+      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
+    };
+    const labelFor = (n) => norm(
+      n.innerText || n.textContent || n.value || n.getAttribute('aria-label') || '',
+    );
+    const controls = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+      .filter(isVisible);
+    const direct = controls.find((n) => /submit/i.test(labelFor(n)));
+    const nested = Array.from(document.querySelectorAll('*'))
+      .filter(isVisible)
+      .find((n) => /submit/i.test(labelFor(n)) && n.closest('button, [role="button"], input[type="submit"]'));
+    const target = direct || nested?.closest('button, [role="button"], input[type="submit"]');
+
+    if (target) {
+      target.scrollIntoView({ block: 'center' });
+      target.click();
+      return { clicked: true, label: labelFor(target) };
+    }
+
+    return {
+      clicked: false,
+      visible_buttons: controls.map(labelFor).filter(Boolean).slice(-20),
+    };
+  });
+
+  if (domResult.clicked) {
+    console.log('[submit form] clicked submit via DOM fallback:', domResult.label);
+    return null;
+  }
+
+  const screenshotPath = `/tmp/airtable-submit-button-missing-${Date.now()}.png`;
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
+  console.log('[submit form] submit button missing screenshot:', screenshotPath);
+  console.log('[submit form] visible buttons:', JSON.stringify(domResult.visible_buttons || []));
+  throw new Error('Submit button not found: ' + (lastError?.message || 'no visible submit control'));
 }
 
 function airtableDateLabel(iso) {
@@ -672,17 +743,8 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
 
     // Submit
     submitOutcome = await stage('submit form', async () => {
-      const submitButton = page
-        .getByRole('button', { name: /Submit Observation/i })
-        .or(page.getByRole('button', { name: /^Submit$/i }))
-        .first();
-
-      await submitButton.scrollIntoViewIfNeeded({ timeout: 5000 });
       const urlBefore = page.url();
-
-      await submitButton.click({ timeout: 5000 }).catch((err) => {
-        throw new Error('Submit click failed: ' + err.message);
-      });
+      const submitButton = await clickSubmitButton(page);
 
       const CAP_MS = 10000;
       const result = await Promise.race([
@@ -703,8 +765,10 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           return null;
         })(),
 
-        submitButton.waitFor({ state: 'hidden', timeout: CAP_MS })
-          .then(() => ({ kind: 'submit_button_hidden' })).catch(() => null),
+        submitButton
+          ? submitButton.waitFor({ state: 'hidden', timeout: CAP_MS })
+            .then(() => ({ kind: 'submit_button_hidden' })).catch(() => null)
+          : Promise.resolve(null),
 
         new Promise((resolve) =>
           setTimeout(() => resolve({ kind: 'cap_reached' }), CAP_MS + 200),
@@ -720,7 +784,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       }
       if (kind === 'validation_error') return 'validation_error';
       return 'unclear';
-    });
+    }, SUBMIT_STAGE_TIMEOUT_MS);
 
     await withTimeout(context.close(), 5000, 'close context timeout').catch(() => undefined);
     await withTimeout(browser.close(), 5000, 'close browser timeout').catch(() => undefined);
