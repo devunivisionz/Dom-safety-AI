@@ -31,8 +31,10 @@ const NAVIGATION_STAGE_TIMEOUT_MS = Number(
     + 5000,
 );
 const SUBMIT_STAGE_TIMEOUT_MS = Number(process.env.FORM_SUBMIT_STAGE_TIMEOUT_MS || 60000);
+const FILL_STAGE_TIMEOUT_MS = Number(process.env.FORM_FILL_STAGE_TIMEOUT_MS || 120000);
 const REQUEST_TIMEOUT_MS = Number(
-  process.env.FORM_REQUEST_TIMEOUT_MS || NAVIGATION_STAGE_TIMEOUT_MS + 90000,
+  process.env.FORM_REQUEST_TIMEOUT_MS
+    || NAVIGATION_STAGE_TIMEOUT_MS + FILL_STAGE_TIMEOUT_MS + SUBMIT_STAGE_TIMEOUT_MS + 30000,
 );
 const CHROMIUM_LAUNCH_ARGS = buildChromiumLaunchArgs(serverlessChromium.args);
 
@@ -405,18 +407,18 @@ async function clickOption(page, value, { exact = true } = {}) {
   const name = exact ? value : new RegExp(escapeRegExp(value), 'i');
   const candidates = exact
     ? [
-      page.getByRole('option', { name, exact: true }).last(),
       page.getByText(value, { exact: true }).last(),
+      page.getByRole('option', { name, exact: true }).last(),
     ]
     : [
-      page.getByRole('option', { name }).first(),
       page.getByText(name).first(),
+      page.getByRole('option', { name }).first(),
     ];
 
   let lastError;
   for (const option of candidates) {
     try {
-      await option.waitFor({ state: 'visible', timeout: 4000 });
+      await option.waitFor({ state: 'visible', timeout: 2500 });
       await option.scrollIntoViewIfNeeded({ timeout: 5000 });
       await option.click({ timeout: 10000 });
       return true;
@@ -470,8 +472,10 @@ async function fillVisibleAirtableControls(page, payload) {
     try {
       const detail = await fn();
       report.push({ field, ok: true, detail });
+      console.log(`[fill field] ${field}: ok ${detail}`);
     } catch (err) {
       report.push({ field, ok: false, detail: err.message });
+      console.log(`[fill field] ${field}: failed ${err.message}`);
     }
   };
 
@@ -765,6 +769,12 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await stage('fill all fields', async () => {
       const fillReport = await fillVisibleAirtableControls(page, payload);
       console.log('[fill all fields] report:', JSON.stringify(fillReport));
+      const failedFields = fillReport.filter((entry) => !entry.ok);
+      if (failedFields.length > 0) {
+        throw new Error('Fill failed: ' + failedFields
+          .map((entry) => `${entry.field}: ${entry.detail}`)
+          .join('; '));
+      }
 
       if (process.env.FORM_ENABLE_LEGACY_DOM_FILL === 'true') {
         const legacyFillReport = await page.evaluate(async (data) => {
@@ -1137,7 +1147,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       // Wait for all interactions to complete
       await page.keyboard.press('Escape').catch(() => undefined);
       await page.waitForTimeout(1500);
-    });
+    }, FILL_STAGE_TIMEOUT_MS);
 
     // Submit
     submitOutcome = await stage('submit form', async () => {
@@ -1278,11 +1288,11 @@ app.get('/', (req, res) => res.json({
   ok: true,
   service: 'AI Safety Manager Form Service',
   submit_mode: SUBMIT_MODE,
-  version: 'v31-playwright-visible-controls',
+  version: 'v32-fill-stage-timeout',
   endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
 }));
 app.get('/health', (req, res) => res.json({
-  ok: true, submit_mode: SUBMIT_MODE, version: 'v31-playwright-visible-controls',
+  ok: true, submit_mode: SUBMIT_MODE, version: 'v32-fill-stage-timeout',
 }));
 app.post('/', submitObservationForm);
 app.post('/submit-observation-form', submitObservationForm);
