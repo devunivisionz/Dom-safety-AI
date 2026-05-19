@@ -354,6 +354,102 @@ async function clickSubmitButton(page) {
   throw new Error('Submit button not found: ' + (lastError?.message || 'no visible submit control'));
 }
 
+async function collectValidationDiagnostics(page, payload) {
+  const screenshotPath = `/tmp/airtable-validation-error-${Date.now()}.png`;
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
+
+  const details = await page.evaluate((data) => {
+    const norm = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+    const isVisible = (n) => {
+      if (!n || !(n instanceof Element)) return false;
+      const s = window.getComputedStyle(n);
+      const b = n.getBoundingClientRect();
+      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
+    };
+    const unique = (items) => Array.from(new Set(items.filter(Boolean)));
+    const textFor = (n) => norm(
+      n.innerText || n.textContent || n.value || n.getAttribute('aria-label') || '',
+    );
+    const interestingText = /required|must|please|missing|invalid|complete|hazard|corrective|days|assigned/i;
+    const visibleTexts = unique(
+      Array.from(document.querySelectorAll('body *'))
+        .filter(isVisible)
+        .map(textFor)
+        .filter((text) => text.length > 0 && text.length < 220 && interestingText.test(text)),
+    ).slice(0, 80);
+
+    const fieldAliases = {
+      project_site: ['Project Site', 'Project'],
+      date_of_event: ['Date of event', 'Date'],
+      time: ['Time'],
+      reporter_name: ['Your Name', 'Reporter Name'],
+      reporter_email: ['Your Email', 'Reporter Email'],
+      company_name: ['Name of Company', 'Company Name'],
+      type_of_observation: ['Type of Observation', 'Observation'],
+      type_of_hazard: ['Type of Hazard', 'Hazard'],
+      stop_work_authority_used: ['Stop Work Authority', 'Stop Work'],
+      description_of_event: ['Description of Event', 'Description'],
+      followup_status: ['Follow-up Status', 'Follow Up Status', 'Followup'],
+      corrective_action: ['Corrective Action'],
+      days_to_complete: ['Days to Complete', 'Days To Complete'],
+      assigned_to: ['Who should the Corrective Action be assigned to', 'Assigned To'],
+    };
+
+    const controls = Array.from(document.querySelectorAll(
+      'input:not([type="hidden"]), textarea, button, [role="button"], [role="combobox"], [role="radio"], [role="checkbox"]',
+    )).filter(isVisible);
+    const labels = Array.from(document.querySelectorAll('label, div, span, p')).filter(isVisible);
+
+    const readField = (aliases) => {
+      const wanted = aliases.map((alias) => alias.toLowerCase());
+      const label = labels.find((n) => {
+        const text = textFor(n).toLowerCase();
+        return text.length < 180 && wanted.some((alias) => text.includes(alias));
+      });
+      if (!label) return { found_label: false, values: [] };
+
+      const lb = label.getBoundingClientRect();
+      const nearby = controls
+        .filter((control) => {
+          const b = control.getBoundingClientRect();
+          return b.top >= lb.top - 30 && b.top <= lb.bottom + 180;
+        })
+        .slice(0, 8)
+        .map((control) => textFor(control))
+        .filter(Boolean);
+
+      return {
+        found_label: true,
+        label: textFor(label).slice(0, 160),
+        values: unique(nearby).slice(0, 8),
+      };
+    };
+
+    const fieldChecks = Object.fromEntries(
+      Object.entries(fieldAliases).map(([field, aliases]) => [field, readField(aliases)]),
+    );
+
+    return {
+      url: window.location.href,
+      expected: {
+        type_of_hazard: data.type_of_hazard,
+        followup_status: data.followup_status,
+        corrective_action: data.corrective_action,
+        days_to_complete: data.days_to_complete,
+      },
+      validation_texts: visibleTexts,
+      field_checks: fieldChecks,
+    };
+  }, {
+    type_of_hazard: payload.type_of_hazard,
+    followup_status: payload.followup_status,
+    corrective_action: payload.corrective_action,
+    days_to_complete: payload.days_to_complete,
+  });
+
+  return { ...details, screenshot_path: screenshotPath };
+}
+
 function airtableDateLabel(iso) {
   const [y, m, d] = iso.split('-').map(Number);
   return m + '/' + d + '/' + y;
@@ -373,6 +469,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
   let submitted = false;
   let stageName = 'initializing';
   let submitOutcome = 'not_attempted';
+  let validationDetails = null;
 
   const stage = async (name, fn, timeoutMs = 30000) => {
     stageName = name;
@@ -421,9 +518,15 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
 
     // Fill all fields using direct DOM manipulation
     await stage('fill all fields', async () => {
-      await page.evaluate((data) => {
+      const fillReport = await page.evaluate(async (data) => {
         const norm = (t) => String(t || '').trim().replace(/\s+/g, ' ');
         const asList = (v) => Array.isArray(v) ? v : [v];
+        const report = [];
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const record = (field, ok, detail = '') => {
+          report.push({ field, ok: Boolean(ok), detail });
+          return ok;
+        };
         const isVisible = (n) => {
           if (!n || !(n instanceof Element)) return false;
           const s = window.getComputedStyle(n);
@@ -496,12 +599,65 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           if (value === undefined || value === null || value === '') return false;
           const input = findInputNearLabel(labelText, fieldId);
           if (input) {
+            input.scrollIntoView({ block: 'center' });
             input.focus();
             setNativeValue(input, value);
             input.dispatchEvent(new Event('blur', { bubbles: true }));
             return true;
           }
           return false;
+        };
+
+        const textMatchesNeedles = (text, needles) => {
+          const lower = norm(text).toLowerCase();
+          return asList(needles)
+            .map((needle) => norm(needle).toLowerCase())
+            .filter(Boolean)
+            .some((needle) => lower.includes(needle)
+              || needle.split(/\s+/).every((word) => lower.includes(word)));
+        };
+
+        const findControlNearLabel = (labelText, fieldId, addText) => {
+          const controls = Array.from(document.querySelectorAll(
+            'button, [role="button"], [role="combobox"], input:not([type="hidden"]), textarea',
+          )).filter(isVisible);
+          const container = findFieldContainer(labelText, fieldId);
+          const scopedControls = container ? controls.filter((control) => container.contains(control)) : [];
+          const addNeedles = asList(addText || []);
+
+          let control = scopedControls.find((n) => addNeedles.length > 0 && textMatchesNeedles(n.textContent, addNeedles));
+          control ||= scopedControls.find((n) => n.getAttribute('role') === 'combobox');
+          control ||= scopedControls.find((n) => n.tagName === 'BUTTON' || n.getAttribute('role') === 'button');
+          control ||= scopedControls[0];
+          if (control) return control;
+
+          const wanted = asList(labelText).map((t) => norm(t).toLowerCase()).filter(Boolean);
+          const labels = Array.from(document.querySelectorAll('label, div, span, p'));
+          const lbl = labels.find((n) => {
+            const text = norm(n.textContent).toLowerCase();
+            return isVisible(n)
+              && wanted.some((label) => text.includes(label))
+              && norm(n.textContent).length < 140;
+          });
+          if (lbl) {
+            const lb = lbl.getBoundingClientRect();
+            const nearby = controls
+              .filter((candidate) => {
+                const b = candidate.getBoundingClientRect();
+                return b.top >= lb.top - 20 && b.top <= lb.bottom + 180;
+              })
+              .sort((a, b) => Math.abs(a.getBoundingClientRect().top - lb.bottom) - Math.abs(b.getBoundingClientRect().top - lb.bottom));
+            control = nearby.find((n) => addNeedles.length > 0 && textMatchesNeedles(n.textContent, addNeedles));
+            control ||= nearby.find((n) => n.getAttribute('role') === 'combobox');
+            control ||= nearby.find((n) => n.tagName === 'BUTTON' || n.getAttribute('role') === 'button');
+            control ||= nearby[0];
+          }
+
+          if (!control && addNeedles.length > 0) {
+            control = controls.find((n) => textMatchesNeedles(n.textContent, addNeedles));
+          }
+
+          return control || null;
         };
 
         // Click by text
@@ -557,43 +713,32 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           return false;
         };
 
-        const chooseFieldOption = (labelText, value, { fieldId, optionId, addText } = {}) => {
+        const chooseFieldOption = async (labelText, value, { fieldId, optionId, addText } = {}) => {
           if (!value) return false;
           if (clickByOption(value, optionId)) return true;
 
-          const container = findFieldContainer(labelText, fieldId);
-          const scopedControls = container
-            ? Array.from(container.querySelectorAll('button, [role="button"], [role="combobox"], input')).filter(isVisible)
-            : [];
-          const addNeedle = norm(addText || '').toLowerCase();
-          let control = scopedControls.find((n) => addNeedle && norm(n.textContent).toLowerCase().includes(addNeedle));
-          control ||= scopedControls.find((n) => n.getAttribute('role') === 'combobox');
-          control ||= scopedControls.find((n) => n.tagName === 'BUTTON' || n.getAttribute('role') === 'button');
-          control ||= scopedControls[0];
-
-          if (!control && addNeedle) {
-            control = Array.from(document.querySelectorAll('button, [role="button"]'))
-              .filter(isVisible)
-              .find((n) => norm(n.textContent).toLowerCase().includes(addNeedle));
-          }
-
+          const control = findControlNearLabel(labelText, fieldId, addText);
           if (control) {
-            control.scrollIntoView({ block: 'nearest' });
+            control.scrollIntoView({ block: 'center' });
             control.click();
           }
 
-          setTimeout(() => {
-            const searchBox = Array.from(document.querySelectorAll(
-              'input[placeholder*="Search"], input[placeholder*="search"], input[role="combobox"]',
-            )).filter(isVisible).at(-1);
-            if (searchBox) {
-              searchBox.focus();
-              setNativeValue(searchBox, value);
-            }
-            setTimeout(() => clickByOption(value, optionId), 500);
-          }, 500);
+          await sleep(700);
 
-          return true;
+          const searchBox = Array.from(document.querySelectorAll(
+            'input[placeholder*="Search"], input[placeholder*="search"], input[role="combobox"]',
+          )).filter(isVisible).at(-1);
+          if (searchBox) {
+            searchBox.focus();
+            setNativeValue(searchBox, value);
+            await sleep(700);
+          }
+
+          const clicked = clickByOption(value, optionId);
+          await sleep(500);
+          document.body.click();
+
+          return clicked;
         };
 
         // 1. Date
@@ -606,6 +751,9 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           else dateInputs[0].value = `${m}/${d}/${y}`;
           dateInputs[0].dispatchEvent(new Event('input', { bubbles: true }));
           dateInputs[0].dispatchEvent(new Event('change', { bubbles: true }));
+          record('date_of_event', true, `${m}/${d}/${y}`);
+        } else {
+          record('date_of_event', false, 'date input not found');
         }
 
         // 2. Time
@@ -621,36 +769,29 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           else timeInputs[0].value = `${h12}:${m}${mer}`;
           timeInputs[0].dispatchEvent(new Event('input', { bubbles: true }));
           timeInputs[0].dispatchEvent(new Event('change', { bubbles: true }));
+          record('time', true, `${h12}:${m}${mer}`);
+        } else {
+          record('time', false, 'time input not found');
         }
 
         // 3. Project Site - click Add button then select
-        const addProjectBtn = Array.from(document.querySelectorAll('button')).find(
-          (b) => norm(b.textContent).toLowerCase().includes('add project')
-        );
-        if (addProjectBtn && data.project_site) {
-          addProjectBtn.click();
-          // Wait a bit then search and select
-          setTimeout(() => {
-            const searchBox = Array.from(document.querySelectorAll('input[placeholder*="Search"], input[placeholder*="search"]'))[0];
-            if (searchBox) {
-              searchBox.focus();
-              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-              if (setter) setter.call(searchBox, data.project_site);
-              else searchBox.value = data.project_site;
-              searchBox.dispatchEvent(new Event('input', { bubbles: true }));
-              setTimeout(() => clickByText(data.project_site, false), 500);
-            }
-          }, 1000);
-        }
+        record('project_site', await chooseFieldOption(
+          ['Project Site', 'Project'],
+          data.project_site,
+          {
+            fieldId: data.field_ids.project,
+            addText: ['add project', 'add project site', 'add'],
+          },
+        ), data.project_site);
 
         // 4. Reporter Name
-        fillInput(['Your Name', 'Reporter Name'], data.reporter_name, data.field_ids.name);
+        record('reporter_name', fillInput(['Your Name', 'Reporter Name'], data.reporter_name, data.field_ids.name), data.reporter_name);
 
         // 5. Reporter Email
-        fillInput(['Your Email', 'Reporter Email'], data.reporter_email, data.field_ids.email);
+        record('reporter_email', fillInput(['Your Email', 'Reporter Email'], data.reporter_email, data.field_ids.email), data.reporter_email);
 
         // 6. Company Name
-        fillInput(['Name of Company', 'Company Name'], data.company_name, data.field_ids.company);
+        record('company_name', fillInput(['Name of Company', 'Company Name'], data.company_name, data.field_ids.company), data.company_name);
 
         // 7. Type of Observation
         const obsLabel = data.type_of_observation === 'Unsafe Condition' 
@@ -658,35 +799,37 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           : data.type_of_observation === 'Unsafe Act'
           ? 'Unsafe Act (Acto Inseguro)'
           : 'Positive/Safe Observation (Observación positiva/segura)';
-        clickByText(obsLabel, true);
+        record('type_of_observation', clickByText(obsLabel, true), obsLabel);
+        await sleep(1000);
 
         if (data.type_of_observation === 'Unsafe Condition') {
-          setTimeout(() => chooseFieldOption(
+          record('type_of_hazard', await chooseFieldOption(
             ['Type of Hazard', 'Hazard'],
             data.type_of_hazard,
             {
               fieldId: data.field_ids.hazard,
               optionId: data.type_of_hazard_id,
-              addText: 'add hazard',
+              addText: ['add hazard', 'add type of hazard', 'add'],
             },
-          ), 2200);
+          ), data.type_of_hazard);
         }
 
         if (data.type_of_observation === 'Positive/Safe Observation') {
-          setTimeout(() => fillInput(
+          record('positive_safe_observation', fillInput(
             ['Positive/Safe Observation', 'Positive Safe Observation'],
             data.positive_safe_observation,
-          ), 2200);
+          ), data.positive_safe_observation);
         }
 
         // 8. Stop Work Authority
         const swLabel = data.stop_work_authority_used === 'Yes' 
           ? 'Yes (Si)' 
           : 'Not Required (No Requerido)';
-        clickByText(swLabel, true);
+        record('stop_work_authority_used', clickByText(swLabel, true), swLabel);
+        await sleep(500);
 
         // 9. Description
-        fillInput(['Description of Event', 'Description'], data.description_of_event, data.field_ids.description);
+        record('description_of_event', fillInput(['Description of Event', 'Description'], data.description_of_event, data.field_ids.description), data.description_of_event);
 
         // 10. Follow-up Status
         const fuLabel = data.followup_status === 'Corrected Onsite'
@@ -694,28 +837,30 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           : data.followup_status === 'Follow Up Needed'
           ? 'Follow Up Needed (Se Requiere Seguimiento)'
           : 'NA';
-        clickByText(fuLabel, true);
+        record('followup_status', clickByText(fuLabel, true), fuLabel);
+        await sleep(1200);
 
-        setTimeout(() => {
-          fillInput(
-            ['Corrective Action', 'Corrective action'],
-            data.corrective_action,
-            data.field_ids.correctiveAction,
-          );
-          fillInput(
-            ['Days to Complete', 'Days To Complete', 'days to complete'],
-            data.days_to_complete,
-            data.field_ids.daysToComplete,
-          );
+        record('corrective_action', fillInput(
+          ['Corrective Action', 'Corrective action'],
+          data.corrective_action,
+          data.field_ids.correctiveAction,
+        ), data.corrective_action);
+        record('days_to_complete', fillInput(
+          ['Days to Complete', 'Days To Complete', 'days to complete'],
+          data.days_to_complete,
+          data.field_ids.daysToComplete,
+        ), String(data.days_to_complete));
 
-          if (data.followup_status === 'Follow Up Needed') {
-            chooseFieldOption(
-              ['Who should the Corrective Action be assigned to', 'Corrective Action be assigned to', 'Assigned To'],
-              data.assigned_to,
-              { fieldId: data.field_ids.assignedTo, addText: 'add' },
-            );
-          }
-        }, 3200);
+        if (data.followup_status === 'Follow Up Needed') {
+          record('assigned_to', await chooseFieldOption(
+            ['Who should the Corrective Action be assigned to', 'Corrective Action be assigned to', 'Assigned To'],
+            data.assigned_to,
+            { fieldId: data.field_ids.assignedTo, addText: ['add assignee', 'add assigned', 'add'] },
+          ), data.assigned_to);
+        }
+
+        await sleep(500);
+        return report;
 
       }, {
         date_of_event: payload.date_of_event,
@@ -736,9 +881,11 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
         days_to_complete: payload.days_to_complete,
         field_ids: AIRTABLE_FIELD_IDS,
       });
+      console.log('[fill all fields] report:', JSON.stringify(fillReport));
 
       // Wait for all interactions to complete
-      await page.waitForTimeout(6500);
+      await page.keyboard.press('Escape').catch(() => undefined);
+      await page.waitForTimeout(1500);
     });
 
     // Submit
@@ -782,7 +929,11 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
         submitted = true;
         return 'success_' + kind;
       }
-      if (kind === 'validation_error') return 'validation_error';
+      if (kind === 'validation_error') {
+        validationDetails = await collectValidationDiagnostics(page, payload);
+        console.log('[submit form] validation details:', JSON.stringify(validationDetails));
+        return 'validation_error';
+      }
       return 'unclear';
     }, SUBMIT_STAGE_TIMEOUT_MS);
 
@@ -790,12 +941,13 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await withTimeout(browser.close(), 5000, 'close browser timeout').catch(() => undefined);
 
     return {
-      success: true,
+      success: submitted,
       submitted,
       submit_outcome: submitOutcome,
       test_mode: payload.test_mode,
       submit_mode: SUBMIT_MODE,
       selected_values: selected,
+      validation_details: validationDetails,
     };
 
   } catch (error) {
@@ -807,6 +959,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       submit_outcome: submitOutcome,
       test_mode: payload.test_mode,
       selected_values: selected,
+      validation_details: validationDetails,
       failed_stage: stageName,
       error: '[' + stageName + '] ' + error.message,
     };
@@ -874,11 +1027,11 @@ app.get('/', (req, res) => res.json({
   ok: true,
   service: 'AI Safety Manager Form Service',
   submit_mode: SUBMIT_MODE,
-  version: 'v28-required-fields',
+  version: 'v29-fill-diagnostics',
   endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
 }));
 app.get('/health', (req, res) => res.json({
-  ok: true, submit_mode: SUBMIT_MODE, version: 'v28-required-fields',
+  ok: true, submit_mode: SUBMIT_MODE, version: 'v29-fill-diagnostics',
 }));
 app.post('/', submitObservationForm);
 app.post('/submit-observation-form', submitObservationForm);
