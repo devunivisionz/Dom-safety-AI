@@ -41,6 +41,7 @@ const FIELD_DEFAULTS = {
   reporter_name: 'Dominique Palmer',
   reporter_email: 'Palmerdom84@gmail.com',
   company_name: 'Turner Construction',
+  contractor_observed: 'Other',
   type_of_observation: 'Unsafe Condition',
   type_of_hazard: 'Fall Protection',
   stop_work_authority_used: 'Not Required',
@@ -130,6 +131,13 @@ function normalizeDaysToComplete(value) {
   const days = Number(value);
   return Number.isFinite(days) && days > 0 ? days : FIELD_DEFAULTS.days_to_complete;
 }
+function normalizeContractorObserved(value) {
+  const v = clean(value);
+  if (!v || ['none', 'n/a', 'na', 'no', 'not applicable'].includes(v.toLowerCase())) {
+    return FIELD_DEFAULTS.contractor_observed;
+  }
+  return v;
+}
 
 function splitDateTime(d, t) {
   const fb = new Date();
@@ -166,6 +174,7 @@ function normalizePayload(rawBody) {
     reporter_name: clean(body.reporter_name) || FIELD_DEFAULTS.reporter_name,
     reporter_email: clean(body.reporter_email) || FIELD_DEFAULTS.reporter_email,
     company_name: clean(body.company_name) || FIELD_DEFAULTS.company_name,
+    contractor_observed: normalizeContractorObserved(body.contractor_observed),
     type_of_observation: obs,
     type_of_hazard: hazardLabel,
     type_of_hazard_id: hazardId,
@@ -354,6 +363,239 @@ async function clickSubmitButton(page) {
   throw new Error('Submit button not found: ' + (lastError?.message || 'no visible submit control'));
 }
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function locatorIsVisible(locator, timeout = 1000) {
+  try {
+    await locator.first().waitFor({ state: 'visible', timeout });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function fillLocator(locator, value, page = null) {
+  const target = locator.first();
+  await target.waitFor({ state: 'visible', timeout: 10000 });
+  await target.scrollIntoViewIfNeeded({ timeout: 5000 });
+
+  const isContentEditable = await target
+    .evaluate((node) => node.isContentEditable || node.getAttribute('contenteditable') !== null)
+    .catch(() => false);
+  if (isContentEditable) {
+    await target.click({ position: { x: 20, y: 20 }, timeout: 10000 });
+    if (page) {
+      await page.keyboard.type(String(value), { delay: 25 });
+      await page.waitForTimeout(150);
+      await page.keyboard.press('Tab').catch(() => undefined);
+      await page.waitForTimeout(150);
+    } else {
+      await target.pressSequentially(String(value), { delay: 5, timeout: 10000 });
+    }
+    return;
+  }
+
+  await target.fill(String(value), { timeout: 10000 });
+  await target.blur().catch(() => undefined);
+}
+
+async function clickOption(page, value, { exact = true } = {}) {
+  const name = exact ? value : new RegExp(escapeRegExp(value), 'i');
+  const candidates = exact
+    ? [
+      page.getByRole('option', { name, exact: true }).last(),
+      page.getByText(value, { exact: true }).last(),
+    ]
+    : [
+      page.getByRole('option', { name }).first(),
+      page.getByText(name).first(),
+    ];
+
+  let lastError;
+  for (const option of candidates) {
+    try {
+      await option.waitFor({ state: 'visible', timeout: 4000 });
+      await option.scrollIntoViewIfNeeded({ timeout: 5000 });
+      await option.click({ timeout: 10000 });
+      return true;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error(`Option not found: ${value}`);
+}
+
+async function selectFromDropdown(page, opener, value, { exact = true, search = true } = {}) {
+  const target = opener.first();
+  await target.waitFor({ state: 'visible', timeout: 10000 });
+  await target.scrollIntoViewIfNeeded({ timeout: 5000 });
+
+  const currentText = await target.textContent().catch(() => '');
+  if (currentText && currentText.includes(value)) return true;
+
+  await target.click({ timeout: 10000 });
+  await page.waitForTimeout(500);
+
+  if (search) {
+    const searchBox = page
+      .locator(
+        'input[placeholder="Search"]:visible, input[placeholder="Find an option"]:visible, input[placeholder="Select an option"]:visible',
+      )
+      .last();
+    if (await locatorIsVisible(searchBox, 1500)) {
+      await searchBox.fill(value, { timeout: 5000 }).catch(() => undefined);
+      await page.waitForTimeout(700);
+    }
+  }
+
+  await clickOption(page, value, { exact });
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(500);
+  return true;
+}
+
+async function clickRadio(page, label) {
+  const radio = page.getByRole('radio', { name: label, exact: true }).first();
+  await radio.waitFor({ state: 'visible', timeout: 10000 });
+  await radio.scrollIntoViewIfNeeded({ timeout: 5000 });
+  await radio.click({ timeout: 10000 });
+}
+
+async function fillVisibleAirtableControls(page, payload) {
+  const report = [];
+  const record = async (field, fn) => {
+    try {
+      const detail = await fn();
+      report.push({ field, ok: true, detail });
+    } catch (err) {
+      report.push({ field, ok: false, detail: err.message });
+    }
+  };
+
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(500);
+
+  await record('date_of_event', async () => {
+    const input = page.locator('input[placeholder*="/yyyy"]:visible').first();
+    const placeholder = await input.getAttribute('placeholder').catch(() => '');
+    const label = airtableDateLabel(payload.date_of_event, placeholder);
+    await fillLocator(input, label);
+    return label;
+  });
+
+  await record('time', async () => {
+    const [h, m] = payload.time.split(':').map(Number);
+    const label = airtableTimeLabel(h, m);
+    await fillLocator(page.locator('input[aria-label="Time"]:visible, input[placeholder*="hh:mm"]:visible').first(), label);
+    return label;
+  });
+
+  await record('project_site', async () => {
+    const selected = page.getByText(payload.project_site, { exact: true }).first();
+    const dropdownSearch = page.locator('input[placeholder="Search"]:visible, input[placeholder="Find an option"]:visible').last();
+    if (await locatorIsVisible(selected, 500) && !(await locatorIsVisible(dropdownSearch, 200))) {
+      return payload.project_site;
+    }
+    await selectFromDropdown(
+      page,
+      page.locator('button[aria-label*="Project Site"]:visible, button:has-text("Add project"):visible').first(),
+      payload.project_site,
+      { exact: true, search: true },
+    );
+    return payload.project_site;
+  });
+
+  await record('reporter_name', async () => {
+    await fillLocator(page.locator('textarea:visible').nth(0), payload.reporter_name);
+    return payload.reporter_name;
+  });
+
+  await record('reporter_email', async () => {
+    await fillLocator(page.locator('textarea:visible').nth(1), payload.reporter_email);
+    return payload.reporter_email;
+  });
+
+  await record('company_name', async () => {
+    await selectFromDropdown(page, page.locator('div[role="combobox"]:visible').nth(0), payload.company_name);
+    return payload.company_name;
+  });
+
+  await record('contractor_observed', async () => {
+    await selectFromDropdown(page, page.locator('div[role="combobox"]:visible').nth(1), payload.contractor_observed);
+    return payload.contractor_observed;
+  });
+
+  await record('type_of_observation', async () => {
+    const label = TYPE_OF_OBSERVATION_LABELS[payload.type_of_observation];
+    await clickRadio(page, label);
+    await page.waitForTimeout(500);
+    return label;
+  });
+
+  if (payload.type_of_observation === 'Unsafe Condition') {
+    await record('type_of_hazard', async () => {
+      await selectFromDropdown(page, page.locator('div[role="combobox"]:visible').nth(2), payload.type_of_hazard, {
+        exact: false,
+        search: true,
+      });
+      return payload.type_of_hazard;
+    });
+  }
+
+  await record('stop_work_authority_used', async () => {
+    const label = STOP_WORK_LABELS[payload.stop_work_authority_used];
+    await clickRadio(page, label);
+    return label;
+  });
+
+  await record('followup_status', async () => {
+    const label = FOLLOW_UP_LABELS[payload.followup_status];
+    await clickRadio(page, label);
+    await page.waitForTimeout(700);
+    return label;
+  });
+
+  await record('description_of_event', async () => {
+    await fillLocator(
+      page.locator('[role="textbox"][contenteditable]:visible, [role="textbox"]:visible').first(),
+      payload.description_of_event,
+      page,
+    );
+    return payload.description_of_event;
+  });
+
+  await record('corrective_action', async () => {
+    const textboxes = page.locator('[role="textbox"][contenteditable]:visible, [role="textbox"]:visible');
+    await fillLocator(textboxes.nth(1), payload.corrective_action, page);
+    return payload.corrective_action;
+  });
+
+  if (payload.followup_status === 'Follow Up Needed') {
+    await record('assigned_to', async () => {
+      await selectFromDropdown(
+        page,
+        page.locator('button[aria-label*="Corrective Action be assigned to"]:visible, button:has-text("Add person"):visible').first(),
+        payload.assigned_to,
+        { exact: true, search: true },
+      );
+      return payload.assigned_to;
+    });
+
+    await record('days_to_complete', async () => {
+      const daysInput = page.locator('input:not([type="hidden"]):visible').last();
+      await fillLocator(daysInput, payload.days_to_complete);
+      return String(payload.days_to_complete);
+    });
+  }
+
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(1000);
+  return report;
+}
+
 async function collectValidationDiagnostics(page, payload) {
   const screenshotPath = `/tmp/airtable-validation-error-${Date.now()}.png`;
   await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
@@ -433,6 +675,7 @@ async function collectValidationDiagnostics(page, payload) {
       url: window.location.href,
       expected: {
         type_of_hazard: data.type_of_hazard,
+        contractor_observed: data.contractor_observed,
         followup_status: data.followup_status,
         corrective_action: data.corrective_action,
         days_to_complete: data.days_to_complete,
@@ -442,6 +685,7 @@ async function collectValidationDiagnostics(page, payload) {
     };
   }, {
     type_of_hazard: payload.type_of_hazard,
+    contractor_observed: payload.contractor_observed,
     followup_status: payload.followup_status,
     corrective_action: payload.corrective_action,
     days_to_complete: payload.days_to_complete,
@@ -450,8 +694,9 @@ async function collectValidationDiagnostics(page, payload) {
   return { ...details, screenshot_path: screenshotPath };
 }
 
-function airtableDateLabel(iso) {
+function airtableDateLabel(iso, formatHint = '') {
   const [y, m, d] = iso.split('-').map(Number);
+  if (/dd\/mm/i.test(formatHint)) return d + '/' + m + '/' + y;
   return m + '/' + d + '/' + y;
 }
 function airtableTimeLabel(h, m) {
@@ -516,9 +761,13 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await page.keyboard.press('Escape').catch(() => undefined);
     await page.waitForTimeout(500);
 
-    // Fill all fields using direct DOM manipulation
+    // Fill all fields with user-like Playwright interactions.
     await stage('fill all fields', async () => {
-      const fillReport = await page.evaluate(async (data) => {
+      const fillReport = await fillVisibleAirtableControls(page, payload);
+      console.log('[fill all fields] report:', JSON.stringify(fillReport));
+
+      if (process.env.FORM_ENABLE_LEGACY_DOM_FILL === 'true') {
+        const legacyFillReport = await page.evaluate(async (data) => {
         const norm = (t) => String(t || '').trim().replace(/\s+/g, ' ');
         const asList = (v) => Array.isArray(v) ? v : [v];
         const report = [];
@@ -869,6 +1118,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
         reporter_name: payload.reporter_name,
         reporter_email: payload.reporter_email,
         company_name: payload.company_name,
+        contractor_observed: payload.contractor_observed,
         type_of_observation: payload.type_of_observation,
         type_of_hazard: payload.type_of_hazard,
         type_of_hazard_id: payload.type_of_hazard_id,
@@ -881,7 +1131,8 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
         days_to_complete: payload.days_to_complete,
         field_ids: AIRTABLE_FIELD_IDS,
       });
-      console.log('[fill all fields] report:', JSON.stringify(fillReport));
+        console.log('[legacy fill all fields] report:', JSON.stringify(legacyFillReport));
+      }
 
       // Wait for all interactions to complete
       await page.keyboard.press('Escape').catch(() => undefined);
@@ -1027,11 +1278,11 @@ app.get('/', (req, res) => res.json({
   ok: true,
   service: 'AI Safety Manager Form Service',
   submit_mode: SUBMIT_MODE,
-  version: 'v29-fill-diagnostics',
+  version: 'v31-playwright-visible-controls',
   endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
 }));
 app.get('/health', (req, res) => res.json({
-  ok: true, submit_mode: SUBMIT_MODE, version: 'v29-fill-diagnostics',
+  ok: true, submit_mode: SUBMIT_MODE, version: 'v31-playwright-visible-controls',
 }));
 app.post('/', submitObservationForm);
 app.post('/submit-observation-form', submitObservationForm);
