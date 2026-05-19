@@ -16,6 +16,7 @@ const FORM_URL =
 
 const TOKEN = process.env.FORM_SERVICE_TOKEN || '';
 const SUBMIT_MODE = process.env.FORM_SUBMIT_MODE || 'live';
+const FORCE_CORRECTED_ONSITE = process.env.FORM_FORCE_CORRECTED_ONSITE !== 'false';
 
 const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 60000);
 const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 90000);
@@ -40,8 +41,11 @@ const FIELD_DEFAULTS = {
   reporter_email: 'Palmerdom84@gmail.com',
   company_name: 'Turner Construction',
   type_of_observation: 'Unsafe Condition',
+  type_of_hazard: 'Fall Protection',
   stop_work_authority_used: 'Not Required',
-  followup_status: 'Follow Up Needed',
+  followup_status: 'Corrected Onsite',
+  corrective_action: 'testing form',
+  days_to_complete: 2,
 };
 
 const TYPE_OF_OBSERVATION_LABELS = {
@@ -54,6 +58,34 @@ const FOLLOW_UP_LABELS = {
   'Corrected Onsite': 'Corrected Onsite (Corrigdo En El Sitio)',
   'Follow Up Needed': 'Follow Up Needed (Se Requiere Seguimiento)',
   NA: 'NA',
+};
+const HAZARD_OPTION_IDS = {
+  'Fall Protection': 'selkBl5v11ihHoGJE',
+  'Fall Protection (Protección contra caídas)': 'selkBl5v11ihHoGJE',
+  selmDXuIL4eJ844NA: 'selkBl5v11ihHoGJE',
+  selkBl5v11ihHoGJE: 'selkBl5v11ihHoGJE',
+};
+const HAZARD_OPTION_LABELS = {
+  selmDXuIL4eJ844NA: 'Fall Protection',
+  selkBl5v11ihHoGJE: 'Fall Protection',
+};
+const AIRTABLE_FIELD_IDS = {
+  fromFormPageElementId: 'pelKHKIhfuvHYpIcB',
+  tableId: 'tblxvZNqJY3EZ8uL0',
+  project: 'fldyEFhAX7NiO8GWd',
+  date: 'flddgn6xC3BK2MHOQ',
+  name: 'fld117rscww5CwOIK',
+  email: 'fld663JWIHg0F739M',
+  company: 'flddBuw7EGIRupKIN',
+  contractor: 'fldYiqjzBDrnf52sv',
+  observation: 'fldMdj34aMlS5a08d',
+  hazard: 'fld2oMD27DOG499fC',
+  stopWork: 'fld9IOlpiDv6QK5rB',
+  description: 'fld4WPpV4lrFvVDZk',
+  followup: 'fldfpXjx1ec9rFafk',
+  correctiveAction: 'fldKr9dcPMMcNVoct',
+  daysToComplete: 'fldz0dpH8vZoOT1As',
+  assignedTo: 'fldPCT3Xz2BvBC8Nm',
 };
 const KNOWN_PROJECT_OPTIONS = [
   'Bauxite (BW150)', 'Bauxite II (BWI110)', 'Bauxite III (BWI100)',
@@ -80,6 +112,23 @@ function normalizeFollowUp(v) {
   if (t === 'na' || t === 'n/a' || t.includes('not applicable')) return 'NA';
   return 'Follow Up Needed';
 }
+function normalizeHazard(value) {
+  const v = clean(value) || FIELD_DEFAULTS.type_of_hazard;
+  return HAZARD_OPTION_IDS[v] || v;
+}
+function normalizeHazardLabel(value) {
+  const v = clean(value) || FIELD_DEFAULTS.type_of_hazard;
+  const lower = v.toLowerCase();
+  if (HAZARD_OPTION_LABELS[v]) return HAZARD_OPTION_LABELS[v];
+  if (lower.includes('fall protection') || lower.includes('protección contra caídas')) {
+    return 'Fall Protection';
+  }
+  return v;
+}
+function normalizeDaysToComplete(value) {
+  const days = Number(value);
+  return Number.isFinite(days) && days > 0 ? days : FIELD_DEFAULTS.days_to_complete;
+}
 
 function splitDateTime(d, t) {
   const fb = new Date();
@@ -103,7 +152,10 @@ function normalizePayload(rawBody) {
   let obs = normalizeObservation(body.type_of_observation);
   if (obs === 'Positive/Safe Observation' && !clean(body.positive_safe_observation)) obs = 'Unsafe Condition';
   const sw = normalizeStopWork(body.stop_work_authority_used);
-  const fu = normalizeFollowUp(body.followup_status);
+  const fu = FORCE_CORRECTED_ONSITE ? 'Corrected Onsite' : normalizeFollowUp(body.followup_status);
+  const hazardLabel = normalizeHazardLabel(body.type_of_hazard);
+  const hazardId = normalizeHazard(hazardLabel);
+  const correctiveAction = clean(body.corrective_action) || FIELD_DEFAULTS.corrective_action;
   return {
     test_mode: false,
     record_id: clean(body.record_id),
@@ -114,20 +166,57 @@ function normalizePayload(rawBody) {
     reporter_email: clean(body.reporter_email) || FIELD_DEFAULTS.reporter_email,
     company_name: clean(body.company_name) || FIELD_DEFAULTS.company_name,
     type_of_observation: obs,
-    type_of_hazard: clean(body.type_of_hazard),
+    type_of_hazard: hazardLabel,
+    type_of_hazard_id: hazardId,
     positive_safe_observation: clean(body.positive_safe_observation),
     stop_work_authority_used: sw,
     description_of_event: clean(body.description_of_event),
-    corrective_action: clean(body.corrective_action),
+    corrective_action: correctiveAction,
     followup_status: fu,
+    assigned_to: clean(body.assigned_to),
+    days_to_complete: normalizeDaysToComplete(body.days_to_complete),
     photo_base64: clean(body.photo_base64),
     photo_url: clean(body.photo_url),
     selected_values: {
       type_of_observation: TYPE_OF_OBSERVATION_LABELS[obs],
+      type_of_hazard: hazardId,
       stop_work_authority_used: STOP_WORK_LABELS[sw],
       followup_status: FOLLOW_UP_LABELS[fu],
     },
   };
+}
+
+function validatePayloadBeforeFill(payload) {
+  if (!payload.days_to_complete) {
+    payload.days_to_complete = FIELD_DEFAULTS.days_to_complete;
+  }
+
+  if (!payload.corrective_action) {
+    payload.corrective_action = FIELD_DEFAULTS.corrective_action;
+  }
+
+  if (FORCE_CORRECTED_ONSITE) {
+    payload.followup_status = 'Corrected Onsite';
+  }
+
+  if (payload.type_of_observation === 'Unsafe Condition' && !payload.type_of_hazard) {
+    payload.type_of_hazard = FIELD_DEFAULTS.type_of_hazard;
+  }
+
+  payload.type_of_hazard = normalizeHazardLabel(payload.type_of_hazard);
+  payload.type_of_hazard_id = normalizeHazard(payload.type_of_hazard);
+
+  if (payload.followup_status === 'Follow Up Needed' && !payload.assigned_to) {
+    throw new Error('Follow Up Needed requires assigned_to field.');
+  }
+
+  payload.selected_values = {
+    ...payload.selected_values,
+    type_of_hazard: payload.type_of_hazard_id,
+    followup_status: FOLLOW_UP_LABELS[payload.followup_status],
+  };
+
+  return payload;
 }
 
 function withTimeout(promise, ms, msg) {
@@ -263,47 +352,85 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
     await stage('fill all fields', async () => {
       await page.evaluate((data) => {
         const norm = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+        const asList = (v) => Array.isArray(v) ? v : [v];
+        const isVisible = (n) => {
+          if (!n || !(n instanceof Element)) return false;
+          const s = window.getComputedStyle(n);
+          const b = n.getBoundingClientRect();
+          return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
+        };
+        const setNativeValue = (input, value) => {
+          const proto = input instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(input, String(value));
+          else input.value = String(value);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        };
         
-        // Helper to find input near label
-        const findInputNearLabel = (labelText) => {
+        const findFieldContainer = (labelText, fieldId) => {
+          if (fieldId) {
+            const byFieldId = document.querySelector(
+              `[data-field-id="${fieldId}"], [data-fieldid="${fieldId}"], [data-field="${fieldId}"], [id="${fieldId}"]`,
+            );
+            if (byFieldId) {
+              return byFieldId.closest('[role="group"], fieldset, section, article, div') || byFieldId;
+            }
+          }
+
+          const wanted = asList(labelText).map((t) => norm(t).toLowerCase()).filter(Boolean);
           const labels = Array.from(document.querySelectorAll('label, div, span, p'));
           const lbl = labels.find((n) => {
-            const s = window.getComputedStyle(n);
-            const b = n.getBoundingClientRect();
-            return s.visibility !== 'hidden' && s.display !== 'none'
-              && b.width > 0 && b.height > 0
-              && norm(n.textContent).toLowerCase().includes(labelText.toLowerCase())
-              && norm(n.textContent).length < 80;
+            const text = norm(n.textContent).toLowerCase();
+            return isVisible(n)
+              && wanted.some((label) => text.includes(label))
+              && norm(n.textContent).length < 120;
+          });
+          return lbl?.closest('[role="group"], fieldset, section, article, div') || lbl || null;
+        };
+
+        // Helper to find input near label
+        const findInputNearLabel = (labelText, fieldId) => {
+          const container = findFieldContainer(labelText, fieldId);
+          const inputSelector = 'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea';
+          const scoped = container
+            ? Array.from(container.querySelectorAll(inputSelector)).filter(isVisible)
+            : [];
+          if (scoped.length > 0) return scoped[0];
+
+          const wanted = asList(labelText).map((t) => norm(t).toLowerCase()).filter(Boolean);
+          const labels = Array.from(document.querySelectorAll('label, div, span, p'));
+          const lbl = labels.find((n) => {
+            const text = norm(n.textContent).toLowerCase();
+            return isVisible(n)
+              && wanted.some((label) => text.includes(label))
+              && norm(n.textContent).length < 120;
           });
           if (!lbl) return null;
           
           const lb = lbl.getBoundingClientRect();
-          const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'));
+          const inputs = Array.from(document.querySelectorAll(inputSelector));
           const candidates = inputs
             .filter((i) => {
-              const s = window.getComputedStyle(i);
               const b = i.getBoundingClientRect();
-              return s.visibility !== 'hidden' && s.display !== 'none'
-                && b.width > 0 && b.height > 0 && b.top >= lb.top - 20 && b.top <= lb.bottom + 100;
+              return isVisible(i) && b.top >= lb.top - 20 && b.top <= lb.bottom + 120;
             })
             .sort((a, b) => Math.abs(a.getBoundingClientRect().top - lb.bottom) - Math.abs(b.getBoundingClientRect().top - lb.bottom));
           return candidates[0] || null;
         };
 
         // Fill text input
-        const fillInput = (labelText, value) => {
-          if (!value) return;
-          const input = findInputNearLabel(labelText);
+        const fillInput = (labelText, value, fieldId) => {
+          if (value === undefined || value === null || value === '') return false;
+          const input = findInputNearLabel(labelText, fieldId);
           if (input) {
             input.focus();
-            const proto = input instanceof HTMLTextAreaElement
-              ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-            if (setter) setter.call(input, value); else input.value = value;
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
+            setNativeValue(input, value);
             input.dispatchEvent(new Event('blur', { bubbles: true }));
+            return true;
           }
+          return false;
         };
 
         // Click by text
@@ -313,11 +440,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           const all = Array.from(document.querySelectorAll(
             '[role="option"],[role="radio"],[role="checkbox"],button,label,span,div,li',
           ));
-          const visible = all.filter((n) => {
-            const s = window.getComputedStyle(n);
-            const b = n.getBoundingClientRect();
-            return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
-          });
+          const visible = all.filter(isVisible);
           let match = exact 
             ? visible.find((n) => norm(n.textContent) === t)
             : visible.find((n) => norm(n.textContent).toLowerCase().includes(lt));
@@ -327,6 +450,79 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
             return true;
           }
           return false;
+        };
+
+        const clickByOption = (texts, optionId) => {
+          const wanted = asList(texts).map(norm).filter(Boolean);
+          const lowerWanted = wanted.map((text) => text.toLowerCase());
+          const all = Array.from(document.querySelectorAll(
+            '[role="option"],[role="radio"],[role="checkbox"],button,label,span,div,li',
+          ));
+          const visible = all.filter(isVisible);
+
+          if (optionId) {
+            const byId = visible.find((n) =>
+              n.id === optionId
+              || n.getAttribute('data-id') === optionId
+              || n.getAttribute('data-option-id') === optionId
+              || n.getAttribute('data-record-id') === optionId);
+            if (byId) {
+              byId.scrollIntoView({ block: 'nearest' });
+              byId.click();
+              return true;
+            }
+          }
+
+          let match = visible.find((n) => wanted.includes(norm(n.textContent)));
+          if (!match) {
+            match = visible.find((n) => lowerWanted.some((text) =>
+              norm(n.textContent).toLowerCase().includes(text)));
+          }
+          if (match) {
+            match.scrollIntoView({ block: 'nearest' });
+            match.click();
+            return true;
+          }
+          return false;
+        };
+
+        const chooseFieldOption = (labelText, value, { fieldId, optionId, addText } = {}) => {
+          if (!value) return false;
+          if (clickByOption(value, optionId)) return true;
+
+          const container = findFieldContainer(labelText, fieldId);
+          const scopedControls = container
+            ? Array.from(container.querySelectorAll('button, [role="button"], [role="combobox"], input')).filter(isVisible)
+            : [];
+          const addNeedle = norm(addText || '').toLowerCase();
+          let control = scopedControls.find((n) => addNeedle && norm(n.textContent).toLowerCase().includes(addNeedle));
+          control ||= scopedControls.find((n) => n.getAttribute('role') === 'combobox');
+          control ||= scopedControls.find((n) => n.tagName === 'BUTTON' || n.getAttribute('role') === 'button');
+          control ||= scopedControls[0];
+
+          if (!control && addNeedle) {
+            control = Array.from(document.querySelectorAll('button, [role="button"]'))
+              .filter(isVisible)
+              .find((n) => norm(n.textContent).toLowerCase().includes(addNeedle));
+          }
+
+          if (control) {
+            control.scrollIntoView({ block: 'nearest' });
+            control.click();
+          }
+
+          setTimeout(() => {
+            const searchBox = Array.from(document.querySelectorAll(
+              'input[placeholder*="Search"], input[placeholder*="search"], input[role="combobox"]',
+            )).filter(isVisible).at(-1);
+            if (searchBox) {
+              searchBox.focus();
+              setNativeValue(searchBox, value);
+            }
+            setTimeout(() => clickByOption(value, optionId), 500);
+          }, 500);
+
+          return true;
         };
 
         // 1. Date
@@ -377,13 +573,13 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
         }
 
         // 4. Reporter Name
-        fillInput('Your Name', data.reporter_name);
+        fillInput(['Your Name', 'Reporter Name'], data.reporter_name, data.field_ids.name);
 
         // 5. Reporter Email
-        fillInput('Your Email', data.reporter_email);
+        fillInput(['Your Email', 'Reporter Email'], data.reporter_email, data.field_ids.email);
 
         // 6. Company Name
-        fillInput('Name of Company', data.company_name);
+        fillInput(['Name of Company', 'Company Name'], data.company_name, data.field_ids.company);
 
         // 7. Type of Observation
         const obsLabel = data.type_of_observation === 'Unsafe Condition' 
@@ -393,6 +589,25 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           : 'Positive/Safe Observation (Observación positiva/segura)';
         clickByText(obsLabel, true);
 
+        if (data.type_of_observation === 'Unsafe Condition') {
+          setTimeout(() => chooseFieldOption(
+            ['Type of Hazard', 'Hazard'],
+            data.type_of_hazard,
+            {
+              fieldId: data.field_ids.hazard,
+              optionId: data.type_of_hazard_id,
+              addText: 'add hazard',
+            },
+          ), 2200);
+        }
+
+        if (data.type_of_observation === 'Positive/Safe Observation') {
+          setTimeout(() => fillInput(
+            ['Positive/Safe Observation', 'Positive Safe Observation'],
+            data.positive_safe_observation,
+          ), 2200);
+        }
+
         // 8. Stop Work Authority
         const swLabel = data.stop_work_authority_used === 'Yes' 
           ? 'Yes (Si)' 
@@ -400,7 +615,7 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
         clickByText(swLabel, true);
 
         // 9. Description
-        fillInput('Description of Event', data.description_of_event);
+        fillInput(['Description of Event', 'Description'], data.description_of_event, data.field_ids.description);
 
         // 10. Follow-up Status
         const fuLabel = data.followup_status === 'Corrected Onsite'
@@ -410,6 +625,27 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
           : 'NA';
         clickByText(fuLabel, true);
 
+        setTimeout(() => {
+          fillInput(
+            ['Corrective Action', 'Corrective action'],
+            data.corrective_action,
+            data.field_ids.correctiveAction,
+          );
+          fillInput(
+            ['Days to Complete', 'Days To Complete', 'days to complete'],
+            data.days_to_complete,
+            data.field_ids.daysToComplete,
+          );
+
+          if (data.followup_status === 'Follow Up Needed') {
+            chooseFieldOption(
+              ['Who should the Corrective Action be assigned to', 'Corrective Action be assigned to', 'Assigned To'],
+              data.assigned_to,
+              { fieldId: data.field_ids.assignedTo, addText: 'add' },
+            );
+          }
+        }, 3200);
+
       }, {
         date_of_event: payload.date_of_event,
         time: payload.time,
@@ -418,13 +654,20 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
         reporter_email: payload.reporter_email,
         company_name: payload.company_name,
         type_of_observation: payload.type_of_observation,
+        type_of_hazard: payload.type_of_hazard,
+        type_of_hazard_id: payload.type_of_hazard_id,
+        positive_safe_observation: payload.positive_safe_observation,
         stop_work_authority_used: payload.stop_work_authority_used,
         description_of_event: payload.description_of_event,
+        corrective_action: payload.corrective_action,
         followup_status: payload.followup_status,
+        assigned_to: payload.assigned_to,
+        days_to_complete: payload.days_to_complete,
+        field_ids: AIRTABLE_FIELD_IDS,
       });
 
       // Wait for all interactions to complete
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(6500);
     });
 
     // Submit
@@ -537,7 +780,21 @@ async function submitObservationForm(req, res) {
   console.log('request timestamp:', new Date().toISOString());
   console.log('submit_mode:', SUBMIT_MODE);
   safeLogPayload('[RAW BODY]', req.body || {});
-  const payload = normalizePayload(req.body || {});
+  let payload;
+  try {
+    payload = validatePayloadBeforeFill(normalizePayload(req.body || {}));
+  } catch (error) {
+    const result = {
+      success: false,
+      submitted: false,
+      failed_stage: 'validate payload',
+      error: '[validate payload] ' + error.message,
+    };
+    safeLogPayload('[FINAL RESULT]', result);
+    console.log('================ FORM REQUEST END ==================');
+    res.status(200).json(result);
+    return;
+  }
   safeLogPayload('[NORMALIZED PAYLOAD]', payload);
   const tracker = { stage: 'queued' };
   const result = await Promise.race([
@@ -553,11 +810,11 @@ app.get('/', (req, res) => res.json({
   ok: true,
   service: 'AI Safety Manager Form Service',
   submit_mode: SUBMIT_MODE,
-  version: 'v27-minimal-submit',
+  version: 'v28-required-fields',
   endpoints: ['GET /health', 'POST /submit-observation-form', 'POST /'],
 }));
 app.get('/health', (req, res) => res.json({
-  ok: true, submit_mode: SUBMIT_MODE, version: 'v27-minimal-submit',
+  ok: true, submit_mode: SUBMIT_MODE, version: 'v28-required-fields',
 }));
 app.post('/', submitObservationForm);
 app.post('/submit-observation-form', submitObservationForm);

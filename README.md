@@ -11,25 +11,48 @@ The submission endpoint accepts JSON from n8n:
 
 ```json
 {
-  "test_mode": true,
-  "date_of_event": "2026-05-04",
-  "time": "14:30",
-  "project_site": "Bauxite III (BWI100)",
-  "reporter_name": "Dominique Palmer",
-  "reporter_email": "Palmerdom84@gmail.com",
+  "test_mode": false,
+  "record_id": "recsdHx0CEGRiXAIt",
+  "date_of_event": "2026-05-18",
+  "time": "07:48",
+  "project_site": "Bauxite (BW150)",
+  "reporter_name": "test",
+  "reporter_email": "test@example.com",
   "company_name": "Turner Construction",
   "contractor_observed": "None",
   "type_of_observation": "Unsafe Condition",
   "type_of_hazard": "Fall Protection",
-  "positive_safe_observation": "",
   "stop_work_authority_used": "Not Required",
-  "description_of_event": "Worker observed near an unprotected edge.",
-  "followup_status": "Follow Up Needed",
-  "photo_base64": "...",
-  "photo_url": "",
-  "photo_filename": "safety-observation.jpg",
-  "photo_content_type": "image/jpeg"
+  "description_of_event": "test",
+  "corrective_action": "testing form",
+  "followup_status": "Corrected Onsite",
+  "days_to_complete": 2
 }
+```
+
+## Test cURL
+
+```bash
+curl -X POST "https://dom-safety-ai.onrender.com/submit-observation-form" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "test_mode": false,
+    "record_id": "recsdHx0CEGRiXAIt",
+    "date_of_event": "2026-05-18",
+    "time": "07:48",
+    "project_site": "Bauxite (BW150)",
+    "reporter_name": "test",
+    "reporter_email": "test@example.com",
+    "company_name": "Turner Construction",
+    "contractor_observed": "None",
+    "type_of_observation": "Unsafe Condition",
+    "type_of_hazard": "Fall Protection",
+    "stop_work_authority_used": "Not Required",
+    "description_of_event": "test",
+    "corrective_action": "testing form",
+    "followup_status": "Corrected Onsite",
+    "days_to_complete": 2
+  }'
 ```
 
 ## Environment
@@ -39,6 +62,7 @@ The submission endpoint accepts JSON from n8n:
 - `FORM_SUBMIT_MODE`: keep as `test` until live submissions are approved. Set to `live` to allow `test_mode: false`.
 - `AIRTABLE_FORM_URL`: defaults to the Module 1 form URL.
 - `JSON_LIMIT`: optional Express JSON body size limit, default `50mb`.
+- `FORM_FORCE_CORRECTED_ONSITE`: defaults to `true`; keeps current tests on `Corrected Onsite` so Airtable does not require `assigned_to`.
 
 ## Local Run
 
