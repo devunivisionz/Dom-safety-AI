@@ -589,7 +589,7 @@ async function fillVisibleAirtableControls(page, payload) {
         page,
         page.locator('button[aria-label*="Corrective Action be assigned to"]:visible, button:has-text("Add person"):visible').first(),
         payload.assigned_to,
-        { exact: true, search: true },
+        { exact: false, search: true },
       );
       return payload.assigned_to;
     });
