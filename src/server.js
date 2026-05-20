@@ -424,7 +424,7 @@ async function clickOption(page, value, { exact = true } = {}) {
   let lastError;
   for (const option of candidates) {
     try {
-      await option.waitFor({ state: 'visible', timeout: 2500 });
+      await option.waitFor({ state: 'visible', timeout: 5000 });
       await option.scrollIntoViewIfNeeded({ timeout: 5000 });
       await option.click({ timeout: 10000 });
       return true;
@@ -436,7 +436,44 @@ async function clickOption(page, value, { exact = true } = {}) {
   throw lastError || new Error(`Option not found: ${value}`);
 }
 
-async function selectFromDropdown(page, opener, value, { exact = true, search = true } = {}) {
+async function getVisibleDropdownDebug(page) {
+  return page.evaluate(() => {
+    const norm = (t) => String(t || '').trim().replace(/\s+/g, ' ');
+    const isVisible = (n) => {
+      if (!n || !(n instanceof Element)) return false;
+      const s = window.getComputedStyle(n);
+      const b = n.getBoundingClientRect();
+      return s.visibility !== 'hidden' && s.display !== 'none' && b.width > 0 && b.height > 0;
+    };
+    const textFor = (n) => norm(
+      n.innerText || n.textContent || n.value || n.getAttribute('aria-label') || n.getAttribute('placeholder') || '',
+    );
+    const options = Array.from(document.querySelectorAll('[role="option"], [role="listbox"] *, [data-testid*="option"], li, button, [role="button"]'))
+      .filter(isVisible)
+      .map(textFor)
+      .filter(Boolean)
+      .slice(-60);
+    const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]), textarea'))
+      .filter(isVisible)
+      .map((n) => ({
+        placeholder: n.getAttribute('placeholder') || '',
+        ariaLabel: n.getAttribute('aria-label') || '',
+        value: n.value || '',
+      }))
+      .slice(-20);
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"]'))
+      .filter(isVisible)
+      .map((n) => ({
+        text: textFor(n),
+        ariaLabel: n.getAttribute('aria-label') || '',
+        role: n.getAttribute('role') || n.tagName,
+      }))
+      .slice(-40);
+    return { inputs, options, buttons };
+  }).catch((err) => ({ error: err.message }));
+}
+
+async function selectFromDropdown(page, opener, value, { exact = true, search = true, fieldName = 'dropdown' } = {}) {
   const target = opener.first();
   await target.waitFor({ state: 'visible', timeout: 10000 });
   await target.scrollIntoViewIfNeeded({ timeout: 5000 });
@@ -445,24 +482,62 @@ async function selectFromDropdown(page, opener, value, { exact = true, search = 
   if (currentText && currentText.includes(value)) return true;
 
   await target.click({ timeout: 10000 });
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(800);
 
   if (search) {
     const searchBox = page
       .locator(
-        'input[placeholder="Search"]:visible, input[placeholder="Find an option"]:visible, input[placeholder="Select an option"]:visible',
+        [
+          'input[placeholder="Search"]:visible',
+          'input[placeholder="Find an option"]:visible',
+          'input[placeholder="Select an option"]:visible',
+          'input[placeholder*="Find"]:visible',
+          'input[placeholder*="Search"]:visible',
+          'input[placeholder*="collaborator"]:visible',
+          'input[placeholder*="person"]:visible',
+          'input[role="combobox"]:visible',
+        ].join(', '),
       )
       .last();
-    if (await locatorIsVisible(searchBox, 1500)) {
-      await searchBox.fill(value, { timeout: 5000 }).catch(() => undefined);
-      await page.waitForTimeout(700);
+
+    if (await locatorIsVisible(searchBox, 2000)) {
+      await searchBox.fill(value, { timeout: 5000 }).catch(async () => {
+        await searchBox.click({ timeout: 3000 }).catch(() => undefined);
+        await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => undefined);
+        await page.keyboard.type(value, { delay: 20 }).catch(() => undefined);
+      });
+      await page.waitForTimeout(1200);
+    } else {
+      // Some Airtable collaborator dropdowns accept typing immediately after opener click,
+      // but do not expose a normal search input selector.
+      await page.keyboard.type(value, { delay: 25 }).catch(() => undefined);
+      await page.waitForTimeout(1200);
     }
   }
 
-  await clickOption(page, value, { exact });
-  await page.keyboard.press('Escape').catch(() => undefined);
-  await page.waitForTimeout(500);
-  return true;
+  try {
+    await clickOption(page, value, { exact });
+    await page.keyboard.press('Escape').catch(() => undefined);
+    await page.waitForTimeout(500);
+    return true;
+  } catch (err) {
+    // Last fallback: Airtable people picker often selects the highlighted result on Enter.
+    await page.keyboard.press('Enter').catch(() => undefined);
+    await page.waitForTimeout(700);
+
+    const afterEnterText = await target.textContent().catch(() => '');
+    if (afterEnterText && afterEnterText.toLowerCase().includes(String(value).toLowerCase().split('@')[0])) {
+      await page.keyboard.press('Escape').catch(() => undefined);
+      return true;
+    }
+
+    const debug = await getVisibleDropdownDebug(page);
+    const screenshotPath = `/tmp/airtable-${fieldName}-dropdown-debug-${Date.now()}.png`;
+    await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
+    console.log(`[dropdown debug] ${fieldName}:`, JSON.stringify({ value, exact, screenshotPath, debug }));
+    await page.keyboard.press('Escape').catch(() => undefined);
+    throw err;
+  }
 }
 
 async function clickRadio(page, label) {
@@ -587,9 +662,9 @@ async function fillVisibleAirtableControls(page, payload) {
     await record('assigned_to', async () => {
       await selectFromDropdown(
         page,
-        page.locator('button[aria-label*="Corrective Action be assigned to"]:visible, button:has-text("Add person"):visible').first(),
+        page.locator('button[aria-label*="Corrective Action be assigned to"]:visible, button:has-text("Add person"):visible').last(),
         payload.assigned_to,
-        { exact: false, search: true },
+        { exact: false, search: true, fieldName: 'assigned_to' },
       );
       return payload.assigned_to;
     });
