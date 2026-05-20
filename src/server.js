@@ -16,7 +16,8 @@ const FORM_URL =
 
 const TOKEN = process.env.FORM_SERVICE_TOKEN || '';
 const SUBMIT_MODE = process.env.FORM_SUBMIT_MODE || 'live';
-const FORCE_CORRECTED_ONSITE = process.env.FORM_FORCE_CORRECTED_ONSITE !== 'false';
+// Default is false: do NOT override the user's follow-up status unless explicitly enabled.
+const FORCE_CORRECTED_ONSITE = process.env.FORM_FORCE_CORRECTED_ONSITE === 'true';
 
 const ACTION_TIMEOUT_MS = Number(process.env.FORM_ACTION_TIMEOUT_MS || 60000);
 const NAVIGATION_TIMEOUT_MS = Number(process.env.FORM_NAVIGATION_TIMEOUT_MS || 90000);
@@ -50,6 +51,8 @@ const FIELD_DEFAULTS = {
   followup_status: 'Corrected Onsite',
   corrective_action: 'testing form',
   days_to_complete: 2,
+  // Used only when follow_up is "Follow Up Needed" and request does not send assigned_to.
+  assigned_to: process.env.FORM_DEFAULT_ASSIGNED_TO || 'Dominique Palmer',
 };
 
 const TYPE_OF_OBSERVATION_LABELS = {
@@ -163,7 +166,8 @@ function normalizePayload(rawBody) {
   let obs = normalizeObservation(body.type_of_observation);
   if (obs === 'Positive/Safe Observation' && !clean(body.positive_safe_observation)) obs = 'Unsafe Condition';
   const sw = normalizeStopWork(body.stop_work_authority_used);
-  const fu = FORCE_CORRECTED_ONSITE ? 'Corrected Onsite' : normalizeFollowUp(body.followup_status);
+  const requestedFollowUp = normalizeFollowUp(body.followup_status || FIELD_DEFAULTS.followup_status);
+  const fu = FORCE_CORRECTED_ONSITE ? 'Corrected Onsite' : requestedFollowUp;
   const hazardLabel = normalizeHazardLabel(body.type_of_hazard);
   const hazardId = normalizeHazard(hazardLabel);
   const correctiveAction = clean(body.corrective_action) || FIELD_DEFAULTS.corrective_action;
@@ -185,13 +189,15 @@ function normalizePayload(rawBody) {
     description_of_event: clean(body.description_of_event),
     corrective_action: correctiveAction,
     followup_status: fu,
-    assigned_to: clean(body.assigned_to),
+    assigned_to: fu === 'Follow Up Needed'
+      ? (clean(body.assigned_to) || FIELD_DEFAULTS.assigned_to)
+      : clean(body.assigned_to),
     days_to_complete: normalizeDaysToComplete(body.days_to_complete),
     photo_base64: clean(body.photo_base64),
     photo_url: clean(body.photo_url),
     selected_values: {
       type_of_observation: TYPE_OF_OBSERVATION_LABELS[obs],
-      type_of_hazard: hazardId,
+      type_of_hazard: hazardLabel,
       stop_work_authority_used: STOP_WORK_LABELS[sw],
       followup_status: FOLLOW_UP_LABELS[fu],
     },
@@ -211,6 +217,10 @@ function validatePayloadBeforeFill(payload) {
     payload.followup_status = 'Corrected Onsite';
   }
 
+  if (payload.followup_status === 'Follow Up Needed' && !payload.assigned_to) {
+    payload.assigned_to = FIELD_DEFAULTS.assigned_to;
+  }
+
   if (payload.type_of_observation === 'Unsafe Condition' && !payload.type_of_hazard) {
     payload.type_of_hazard = FIELD_DEFAULTS.type_of_hazard;
   }
@@ -218,13 +228,9 @@ function validatePayloadBeforeFill(payload) {
   payload.type_of_hazard = normalizeHazardLabel(payload.type_of_hazard);
   payload.type_of_hazard_id = normalizeHazard(payload.type_of_hazard);
 
-  if (payload.followup_status === 'Follow Up Needed' && !payload.assigned_to) {
-    throw new Error('Follow Up Needed requires assigned_to field.');
-  }
-
   payload.selected_values = {
     ...payload.selected_values,
-    type_of_hazard: payload.type_of_hazard_id,
+    type_of_hazard: payload.type_of_hazard,
     followup_status: FOLLOW_UP_LABELS[payload.followup_status],
   };
 
@@ -1154,20 +1160,21 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
       const urlBefore = page.url();
       const submitButton = await clickSubmitButton(page);
 
-      const CAP_MS = 10000;
+      // Airtable sometimes keeps static words like "required" on the page.
+      // So we first wait for real success signals, then diagnose only if success is not found.
+      const CAP_MS = Number(process.env.FORM_SUBMIT_RESULT_WAIT_MS || 15000);
       const result = await Promise.race([
         page.getByText(/thank you|response has been submitted|submission received|submitted successfully/i)
           .first().waitFor({ state: 'visible', timeout: CAP_MS })
           .then(() => ({ kind: 'success_text' })).catch(() => null),
 
-        page.getByText(/required|must be filled|please complete|invalid|missing/i)
-          .first().waitFor({ state: 'visible', timeout: CAP_MS })
-          .then(() => ({ kind: 'validation_error' })).catch(() => null),
-
         (async () => {
           const start = Date.now();
           while (Date.now() - start < CAP_MS) {
-            if (page.url() !== urlBefore) return { kind: 'url_changed', to: page.url() };
+            const currentUrl = page.url();
+            if (currentUrl !== urlBefore && /form|airtable/i.test(currentUrl)) {
+              return { kind: 'url_changed', to: currentUrl };
+            }
             await page.waitForTimeout(250);
           }
           return null;
@@ -1190,12 +1197,14 @@ async function fillForm(payload, req, tracker = { stage: 'initializing' }) {
         submitted = true;
         return 'success_' + kind;
       }
-      if (kind === 'validation_error') {
-        validationDetails = await collectValidationDiagnostics(page, payload);
-        console.log('[submit form] validation details:', JSON.stringify(validationDetails));
-        return 'validation_error';
-      }
-      return 'unclear';
+
+      validationDetails = await collectValidationDiagnostics(page, payload);
+      console.log('[submit form] diagnostics after no success signal:', JSON.stringify(validationDetails));
+
+      const hasRealValidationText = Array.isArray(validationDetails?.validation_texts)
+        && validationDetails.validation_texts.some((text) => /required|must be filled|please complete|invalid|missing/i.test(text));
+
+      return hasRealValidationText ? 'validation_error' : 'unclear_after_submit';
     }, SUBMIT_STAGE_TIMEOUT_MS);
 
     await withTimeout(context.close(), 5000, 'close context timeout').catch(() => undefined);
