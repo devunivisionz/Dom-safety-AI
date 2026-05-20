@@ -535,7 +535,22 @@ async function selectFromDropdown(page, opener, value, { exact = true, search = 
     const screenshotPath = `/tmp/airtable-${fieldName}-dropdown-debug-${Date.now()}.png`;
     await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
     console.log(`[dropdown debug] ${fieldName}:`, JSON.stringify({ value, exact, screenshotPath, debug }));
+
+    const visibleOptions = Array.isArray(debug?.options) ? debug.options : [];
+    const visibleButtons = Array.isArray(debug?.buttons) ? debug.buttons : [];
+    const hasNoResults = visibleOptions.some((text) => /no results/i.test(text))
+      || visibleButtons.some((item) => /no results/i.test(item?.text || ''));
+
     await page.keyboard.press('Escape').catch(() => undefined);
+
+    if (fieldName === 'assigned_to' && hasNoResults) {
+      throw new Error(
+        `Assigned To person not found in Airtable dropdown: "${value}". `
+        + 'Airtable returned "No results", so this person is not available as a selectable collaborator/person on the form. '
+        + 'Use an existing collaborator name/email from that dropdown, or add this person to the Airtable base/field first.',
+      );
+    }
+
     throw err;
   }
 }
